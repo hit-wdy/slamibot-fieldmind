@@ -1,0 +1,43 @@
+# Runtime observations, customer images, indices and local reports.
+/data/
+/reports/
+/models/*
+!/models/assets.json
+/third_party/RADIO/
+*.sqlite
+*.sqlite-*
+*.db
+*.npy
+*.npz
+*.bin
+*.blob
+*.pth
+*.pt
+*.onnx
+*.bag
+*.log
+
+# Python environments and build output.
+.venv*/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Machine-specific configuration and credentials.
+.env
+.env.*
+!.env.example
+*.local.yaml
+*.local.json
+.idea/
+.vscode/
+.claude/
+Thumbs.db
+.DS_Store

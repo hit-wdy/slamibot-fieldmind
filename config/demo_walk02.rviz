@@ -1,0 +1,36 @@
+Panels:
+  - Class: rviz/Displays
+    Name: Displays
+Visualization Manager:
+  Class: ""
+  Global Options:
+    Fixed Frame: simulated_map
+    Frame Rate: 15
+  Displays:
+    - Class: rviz/Image
+      Name: CAM_A replay
+      Enabled: true
+      Image Topic: /demo/camera/image_raw
+      Transport Hint: raw
+      Queue Size: 2
+    - Class: rviz/Path
+      Name: Simulated trajectory
+      Enabled: true
+      Topic: /demo/path
+      Color: 25; 220; 255
+      Line Style: Lines
+      Line Width: 0.1
+    - Class: rviz/MarkerArray
+      Name: Navigation points (simulated)
+      Enabled: true
+      Marker Topic: /demo/navigation_points
+      Queue Size: 10
+  Views:
+    Current:
+      Class: rviz/TopDownOrtho
+      Scale: 12
+      X: 25
+      Y: 0
+Window Geometry:
+  Width: 1400
+  Height: 900

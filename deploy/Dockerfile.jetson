@@ -1,0 +1,18 @@
+# Select the base only after comparing the device's L4T with NVIDIA's matrix.
+# No default: a container does not make an incompatible CUDA driver compatible.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+WORKDIR /opt/slamibot-fieldmind
+COPY pyproject.toml ./
+COPY src ./src
+COPY configs ./configs
+COPY models/assets.json ./models/assets.json
+COPY third_party/RADIO ./third_party/RADIO
+COPY scripts ./scripts
+# Refuse CPU/x86 images and unsupported framework versions before resolving deps.
+RUN python3 -c "import platform,torch; assert platform.machine()=='aarch64'; assert torch.version.cuda; assert tuple(map(int,torch.__version__.split('+')[0].split('.')[:2])) >= (2,8)"
+RUN python3 -c "import importlib.metadata as m; print('torch=='+m.version('torch')); print('torchvision=='+m.version('torchvision'))" > /tmp/base-constraints.txt
+RUN python3 -m pip install --no-cache-dir -c /tmp/base-constraints.txt -e '.[backend]'
+ENV HF_HUB_OFFLINE=1
+ENV HF_HUB_DISABLE_TELEMETRY=1
+CMD ["python3", "-m", "slamibot_fieldmind.backend", "--model-config", "configs/jetson.yaml"]

@@ -1,0 +1,13 @@
+data
+reports
+.git
+.env
+.env.*
+.venv*
+*.egg-info
+models/*
+!models/assets.json
+.pytest_cache
+.ruff_cache
+**/__pycache__
+**/*.pyc

@@ -1,0 +1,39 @@
+model:
+  # Verified in phase A against the pinned checkpoint. See
+  # reports/phase_a_image_encoder.md before changing any of these.
+  backend: radio
+  version: radio_v2.5-b
+  adaptor: clip
+  checkpoint: models/hub/checkpoints/radio-v2.5-b_half.pth.tar
+  # Empty means "use the pinned SHA-256 from models/assets.json".
+  checkpoint_sha256: ""
+  source_commit: 4ffaf15d0ff48197c194e306772bdb5fb92db230
+
+  device: cuda:0
+  # Text tower residency, measured on this GPU (10-word batch / single word):
+  #   cuda:0 + bfloat16   111 ms / 15.6 ms   process peak 1148 MB
+  #   cuda:0 + float32    335 ms / 26.5 ms   process peak 2661 MB  (tight on 4 GB)
+  #   cpu    + float32   3805 ms /  233 ms   process peak  279 MB
+  # bfloat16 agrees with float32 to cosine 0.99997 and ranks identically, so the
+  # GPU is the default and `cpu` is the fallback when VRAM is contended.
+  text_encoder_device: cuda:0
+  text_encoder_dtype: bfloat16
+
+  # Measured on the RTX 3050 Laptop GPU: bf16 is ~3x faster than float32 at the
+  # same input, agrees with float32 to cosine 0.99995, and peaks at ~700 MB of
+  # allocations either way. 'auto' keeps the checkpoint's own dtype (float32);
+  # 'float16' was not measured.
+  dtype: bfloat16
+
+  # One element keeps the aspect ratio (the shortest edge is resized); two
+  # elements centre-crop to [height, width]. A 16:9 frame centre-cropped to
+  # 768x768 loses its left and right thirds, so the aspect-preserving form is the
+  # default for a wide camera. Measured on a 576x1024 frame:
+  #   [512]      ->  512x912,  1824 tokens,  59 ms/frame (17 fps), full field of view
+  #   [768]      -> 768x1360,  4080 tokens, 152 ms/frame (6.6 fps), full field of view
+  #   [768, 768] ->  768x768,  2304 tokens,  87 ms/frame (11 fps), centre crop only
+  input_resolution: [512]
+  # null = use the model's min_resolution_step (the patch size).
+  resize_multiple: null
+  max_dim: false
+  batch_size: 1

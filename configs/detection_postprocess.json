@@ -1,0 +1,27 @@
+{
+  "version": "precision_v1",
+  "min_confidence": 0.6,
+  "class_thresholds": {
+    "person": 0.4,
+    "car": 0.45,
+    "bicycle": 0.4,
+    "chair": 0.4,
+    "potted plant": 0.35,
+    "vase": 0.75,
+    "bed": 0.8,
+    "dining table": 0.7,
+    "refrigerator": 0.9,
+    "microwave": 0.9,
+    "train": 0.9,
+    "surfboard": 0.9,
+    "skateboard": 0.85,
+    "suitcase": 0.8
+  },
+  "same_class_iou": 0.45,
+  "vehicle_conflict_iou": 0.7,
+  "vehicle_containment": 0.88,
+  "vehicle_min_area_ratio": 0.3,
+  "large_surface_guard": true,
+  "large_surface_min_confidence": 0.97,
+  "max_detections": 100
+}

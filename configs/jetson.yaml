@@ -1,0 +1,13 @@
+model:
+  backend: radio
+  version: radio_v2.5-b
+  adaptor: clip
+  checkpoint: models/hub/checkpoints/radio-v2.5-b_half.pth.tar
+  source_commit: 4ffaf15d0ff48197c194e306772bdb5fb92db230
+  device: cuda:0
+  dtype: bfloat16
+  # Orin has shared RAM. Keep a single instance, and measure the actual peak.
+  text_encoder_device: cuda:0
+  text_encoder_dtype: bfloat16
+  input_resolution: [512]
+  batch_size: 1

@@ -1,0 +1,60 @@
+{
+  "note": "Pinned model assets. Every entry is downloaded by scripts/fetch_assets.py and rejected unless the SHA-256 matches. DIGESTS ARE TRUST-ON-FIRST-USE: they were read from the publisher's LFS metadata, not independently audited.",
+  "assets": [
+    {
+      "name": "radio_v2.5_b",
+      "kind": "http",
+      "path": "models/hub/checkpoints/radio-v2.5-b_half.pth.tar",
+      "url": "https://huggingface.co/nvidia/RADIO/resolve/main/radio-v2.5-b_half.pth.tar?download=true",
+      "size": 649011254,
+      "sha256": "6bff4bd732d815136652d454598e8fe6c6f4e658716d5e6a697f0e6b60bd8a98",
+      "source": "https://huggingface.co/nvidia/RADIO",
+      "license": "NVIDIA Source Code License (NSCLv1) - research and development use only",
+      "note": "RADIOv2.5 ViT-B/16 backbone. Its 'clip' adaptor is OpenCLIP ViT-H-14-378-quickgelu/dfn5b, so the entry below is required for the same vector space."
+    },
+    {
+      "name": "dfn5b_clip_vit_h14_378",
+      "kind": "hf_hub",
+      "repo_id": "apple/DFN5B-CLIP-ViT-H-14-378",
+      "filename": "open_clip_pytorch_model.bin",
+      "path": "models/hf/hub",
+      "url": "https://huggingface.co/apple/DFN5B-CLIP-ViT-H-14-378/resolve/main/open_clip_pytorch_model.bin",
+      "size": 3947081637,
+      "sha256": "c07a17b547d461c60a3cce5062b26bf8545b13de602c4c59d8490361eb716033",
+      "revision": "01b771ed0d1395ca5ffdd279897d665ebe00dfd2",
+      "source": "https://huggingface.co/apple/DFN5B-CLIP-ViT-H-14-378",
+      "license": "Apple AMLR - research and development use only",
+      "note": "Text tower of the DFN5B CLIP that RADIO's 'clip' adaptor is aligned to. open_clip builds the adaptor by requesting revision 'main'; the pinned SHA-256 is the guard against that branch moving."
+    },
+    {
+      "name": "yolov6_rvc2",
+      "kind": "local_copy",
+      "path": "models/yolov6/yolov6nr1_coco_512x288_rvc2.tar.xz",
+      "source": "copied from ../oak4p-yolov6/models/ (built by that project for this OAK-4P-New)",
+      "size": 7920292,
+      "sha256": "649da643f45661c8ef3aee44206fbc6c7077c5bd1ee6c8509fb2f932c0e2451f",
+      "license": "YOLOv6 (GPL-3.0 upstream); COCO-pretrained, converted to an RVC2 NN archive",
+      "note": "Detection network. Runs on the OAK VPU so the host GPU stays free for RADIO. Outputs 259/483/707 at strides 8/16/32."
+    },
+    {
+      "name": "yolov6_ir_xml",
+      "kind": "local_copy",
+      "path": "models/yolov6/yolov6nr1_coco_512x288.xml",
+      "source": "copied from ../oak4p-yolov6/models/yolov6nr1_coco_512x288.xml",
+      "size": 257570,
+      "sha256": "f591d5c66e40d84e994a0f188a1e1337b72549c92bb9430c02a208a9325432f8",
+      "license": "YOLOv6 (GPL-3.0 upstream)",
+      "note": "Optional OpenVINO CPU replay validation only; production OAK blob unchanged."
+    },
+    {
+      "name": "yolov6_ir_bin",
+      "kind": "local_copy",
+      "path": "models/yolov6/yolov6nr1_coco_512x288.bin",
+      "source": "copied from ../oak4p-yolov6/models/yolov6nr1_coco_512x288.bin",
+      "size": 8634878,
+      "sha256": "20dafb2d6ce2a3bf8741c09c4bfa05830528a9100785f99a5c71d38a2eb6b944",
+      "license": "YOLOv6 (GPL-3.0 upstream)",
+      "note": "Optional OpenVINO CPU replay validation only; production OAK blob unchanged."
+    }
+  ]
+}
