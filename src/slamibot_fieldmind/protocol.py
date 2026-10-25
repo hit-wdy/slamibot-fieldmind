@@ -37,6 +37,19 @@ def timestamp(value):
     return parsed.astimezone(UTC).isoformat(timespec="milliseconds")
 
 
+def observation_key(m):
+    """Producer identity, independent of HTTP retry/receive timestamps."""
+    key = [
+        m.get("session_id"),
+        m.get("coordinate_id"),
+        m["device_id"],
+        m["camera_id"],
+        m["source_id"],
+        m["source_sequence"],
+    ]
+    return "kf-" + hashlib.sha256(repr(key).encode()).hexdigest()[:32]
+
+
 def validate_observation(raw, jpeg):
     m = dict(raw)
     if m.get("protocol_version", 1) != 1:
@@ -96,13 +109,8 @@ def validate_observation(raw, jpeg):
         image.verify()
         m["image_width"], m["image_height"] = image.size
     # Include the capture producer's boot ID; device sequence counters restart.
-    key = [
-        m.get("session_id"),
-        m.get("coordinate_id"),
-        m["device_id"],
-        m["camera_id"],
-        m["source_id"],
-        m["source_sequence"],
-    ]
-    m["frame_id"] = "kf-" + hashlib.sha256(repr(key).encode()).hexdigest()[:32]
+    m["observation_key"] = observation_key(m)
+    moment = dt.datetime.fromisoformat(m["captured_at"])
+    suffix = moment.strftime("%Y%m%dT%H%M%S") + f"{moment.microsecond // 1000:03d}Z"
+    m["frame_id"] = f"{m['observation_key']}-{suffix}"
     return m

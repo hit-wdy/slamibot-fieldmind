@@ -40,6 +40,8 @@ class KeyframePolicy:
     rotation_deg: float = 15.0
     max_interval_s: float = 3.0
     min_interval_s: float = 0.5
+    timeout_distance_m: float = 0.05
+    timeout_rotation_deg: float = 2.0
 
     def __post_init__(self):
         if (
@@ -50,18 +52,24 @@ class KeyframePolicy:
                     self.rotation_deg,
                     self.max_interval_s,
                     self.min_interval_s,
+                    self.timeout_distance_m,
+                    self.timeout_rotation_deg,
                 )
             )
             or self.min_interval_s > self.max_interval_s
+            or self.timeout_distance_m > self.distance_m
+            or self.timeout_rotation_deg > self.rotation_deg
         ):
             raise ValueError("invalid keyframe thresholds")
 
-    def decide(self, stamp_ns, pose, previous):
+    def decide(self, stamp_ns, pose, previous, *, body_pose=None):
         result = {
             "reasons": [],
             "distance_m": None,
             "rotation_deg": None,
             "interval_s": None,
+            "pose_source": None,
+            "status": "first",
         }
         if previous is None:
             result["reasons"] = ["first"]
@@ -69,9 +77,22 @@ class KeyframePolicy:
         elapsed = (stamp_ns - previous["source_stamp_ns"]) / 1e9
         result["interval_s"] = elapsed
         if elapsed < self.min_interval_s:
+            result["status"] = "time_rollback" if elapsed < 0 else "min_interval"
             return result
         before = previous.get("camera_pose")
+        # Always compare the same kind of pose. A body fallback is sampling
+        # evidence only; it must never populate camera_pose or spatial queries.
         if pose is not None and before is not None and pose["frame"] == before["frame"]:
+            result["pose_source"] = "camera_pose"
+        else:
+            pose, before = body_pose, previous.get("body_pose")
+            if (
+                pose is not None
+                and before is not None
+                and pose["frame"] == before["frame"]
+            ):
+                result["pose_source"] = "body_pose"
+        if result["pose_source"] is not None:
             result["distance_m"] = math.dist(
                 [pose[k] for k in ("x", "y", "z")], [before[k] for k in ("x", "y", "z")]
             )
@@ -83,6 +104,25 @@ class KeyframePolicy:
                 result["reasons"].append("distance")
             if result["rotation_deg"] + 1e-9 >= self.rotation_deg:
                 result["reasons"].append("rotation")
-        if elapsed >= self.max_interval_s:
-            result["reasons"].append("timeout")
+            moved = (
+                result["distance_m"] + 1e-9 >= self.timeout_distance_m
+                or result["rotation_deg"] + 1e-9 >= self.timeout_rotation_deg
+            )
+            # A timeout supplements slow motion, rather than periodically
+            # recording a parked robot or millimetre-scale SLAM jitter.
+            if elapsed >= self.max_interval_s and moved:
+                result["reasons"].append("timeout")
+            result["status"] = (
+                "selected"
+                if result["reasons"]
+                else "waiting_for_threshold"
+                if moved
+                else "stationary"
+            )
+        else:
+            # Missing pose cannot establish that a robot is stationary. Retain
+            # explicit time-only coverage for offline/no-SLAM operation.
+            result["status"] = "pose_unavailable"
+            if elapsed >= self.max_interval_s:
+                result["reasons"].append("timeout")
         return result

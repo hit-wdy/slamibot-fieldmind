@@ -122,6 +122,148 @@ def test_spatial_temporal_policy():
     assert rotation_deg([0, 0, 0, 1], [0, math.sin(0.2), 0, math.cos(0.2)]) > 20
 
 
+@pytest.mark.parametrize(
+    "seconds,x,angle,reasons,status",
+    [
+        (3600, 0, 0, [], "stationary"),
+        (3600, 0.049, 1.99, [], "stationary"),
+        (2.999, 0.05, 0, [], "waiting_for_threshold"),
+        (3, 0.05, 0, ["timeout"], "selected"),
+        (3, 0, 2, ["timeout"], "selected"),
+        (0.5, 0, 15, ["rotation"], "selected"),
+        (0.499, 1, 90, [], "min_interval"),
+        (-1, 1, 90, [], "time_rollback"),
+    ],
+)
+def test_static_and_slow_motion_policy(seconds, x, angle, reasons, status):
+    previous = dict(source_stamp_ns=0, camera_pose=pose())
+    result = KeyframePolicy().decide(int(seconds * 1e9), pose(x, angle), previous)
+    assert result["reasons"] == reasons
+    assert result["status"] == status
+
+
+def test_body_pose_sampling_never_invents_camera_pose(runtime):
+    first = runtime.ingest(observation(camera_pose=None), jpeg())
+    still = runtime.ingest(observation(2, 100_000_000_000, camera_pose=None), jpeg())
+    assert still["status"] == "skipped"
+    assert still["selection"]["pose_source"] == "body_pose"
+    # Even when extrinsics become available, use the common body reference;
+    # never subtract a current camera position from an earlier body position.
+    moved = runtime.ingest(observation(3, 101_000_000_000, x=0.5), jpeg())
+    assert moved["status"] == "accepted"
+    assert moved["selection"]["pose_source"] == "body_pose"
+    assert BackendQuery(runtime).get_frame(first["frame_id"])["camera_pose"] is None
+    assert runtime.health()["counters"]["overdue_gaps"] == 0
+
+
+def test_static_stream_keeps_only_one_history_image_but_refreshes_live(runtime):
+    runtime.ingest(observation(), jpeg())
+    image = jpeg()
+    for seq in range(2, 122):
+        # Alternating sub-threshold pose noise, over ten minutes.
+        result = runtime.ingest(
+            observation(seq, seq * 5_000_000_000, x=0.01 * (seq % 2), angle=0.5), image
+        )
+        assert result["status"] == "skipped"
+    q = BackendQuery(runtime)
+    assert q.find_frames()["matched_frame_count"] == 1
+    assert len(list(runtime.config.root.glob("images/**/*.jpg"))) == 1
+    assert runtime.live["CAM_A"][0]["source_sequence"] == 121
+    assert len(runtime.live) == 1
+    assert runtime.health()["counters"]["stationary_skipped"] == 120
+    # Moving 5 cm relative to the accepted KF (not the latest skipped frame)
+    # must still trigger a timeout sample.
+    result = runtime.ingest(observation(122, 610_000_000_000, x=0.05), image)
+    assert result["status"] == "accepted"
+    assert runtime.health()["counters"]["overdue_gaps"] == 0
+
+
+def test_new_frame_ids_preserve_retry_identity_across_restart(tmp_path):
+    import re
+
+    config = BackendConfig(root=tmp_path, min_free_bytes=0, require_mount=False)
+    r = BackendRuntime(config, Encoder)
+    try:
+        r.session(
+            dict(session_id="s1", coordinate_id="c1", task_id="task1", state="running")
+        )
+        original = observation(captured_at="2026-10-25T09:08:07.123+08:00")
+        first = r.ingest(original, jpeg())
+        assert re.fullmatch(r"kf-[0-9a-f]{32}-20261025T010807123Z", first["frame_id"])
+        # A receive-time fallback may change between retries. The first accepted
+        # frame ID and evidence path must still win, including after restart.
+        retry = observation(received_at="2026-10-25T03:00:00+00:00")
+        again = r.ingest(retry, jpeg())
+        assert again["status"] == "duplicates"
+        assert again["frame_id"] == first["frame_id"]
+        wait_for(
+            lambda: (
+                BackendQuery(r).get_frame(first["frame_id"])["radio_status"] == "ready"
+            )
+        )
+    finally:
+        r.close()
+    r = BackendRuntime(config, Encoder)
+    try:
+        assert r.ingest(retry, jpeg())["frame_id"] == first["frame_id"]
+        assert len(list(tmp_path.glob("images/**/*.jpg"))) == 1
+        assert (
+            BackendQuery(r).get_frame(first["frame_id"])["image_path"]
+            == first["image_path"]
+        )
+    finally:
+        r.close()
+
+
+def test_schema_v1_migration_keeps_old_frame_id_and_image(tmp_path):
+    import sqlite3
+    from slamibot_fieldmind.protocol import validate_observation
+    from slamibot_fieldmind.semantic_store import SEMANTIC_SCHEMA
+    from slamibot_fieldmind.store import SCHEMA, SCHEMA_VERSION
+
+    m = validate_observation(observation(), jpeg())
+    old_id = m.pop("observation_key")
+    m["frame_id"] = old_id
+    image_path = f"images/old/{old_id}.jpg"
+    (tmp_path / "images/old").mkdir(parents=True)
+    (tmp_path / image_path).write_bytes(jpeg())
+    with sqlite3.connect(tmp_path / "records.sqlite") as db:
+        db.executescript(SCHEMA + SEMANTIC_SCHEMA)
+        db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        db.execute("INSERT INTO semantic_schema VALUES (1)")
+        db.execute(
+            "INSERT INTO observations(frame_id,collection_id,session_id,coordinate_id,camera_id,captured_at,source_stamp_ns,image_path,radio_status,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                old_id,
+                "radio_clip_v1",
+                "s1",
+                "c1",
+                "CAM_A",
+                m["captured_at"],
+                m["source_stamp_ns"],
+                image_path,
+                "pending",
+                json.dumps(m),
+            ),
+        )
+    r = BackendRuntime(
+        BackendConfig(root=tmp_path, min_free_bytes=0, require_mount=False), Encoder
+    )
+    try:
+        q = BackendQuery(r)
+        wait_for(lambda: q.get_frame(old_id)["radio_status"] == "ready")
+        assert q.get_frame(old_id)["image_path"] == image_path
+        assert q.image(
+            old_id
+        )  # Old image and newly recovered vector remain accessible.
+        retry = r.ingest(observation(received_at="2026-10-25T03:00:00+00:00"), jpeg())
+        assert retry["status"] == "duplicates"
+        assert retry["frame_id"] == old_id
+        assert len(list(tmp_path.glob("images/**/*.jpg"))) == 1
+    finally:
+        r.close()
+
+
 def test_end_to_end_metadata_image_search_and_coordinates(runtime):
     q = BackendQuery(runtime)
     first = runtime.ingest(observation(), jpeg())
@@ -209,6 +351,77 @@ def test_missing_pose_and_detector_are_not_empty_scene(runtime):
         q.find_frames(near_frame_id=result["frame_id"], radius_m=3)
     runtime.ingest(observation(2, 4_000_000_000, detections=[]), jpeg())
     assert q.describe()["views"][0]["label_counts"] == {}
+
+
+def test_current_evidence_uses_unsaved_live_frame_and_same_metadata(runtime):
+    q = BackendQuery(runtime)
+    first = runtime.ingest(observation(), jpeg())
+    output = io.BytesIO()
+    Image.new("RGB", (64, 48), "blue").save(output, "JPEG")
+    skipped = runtime.ingest(
+        observation(2, 10_000_000_000, detections=[]), output.getvalue()
+    )
+    assert skipped["status"] == "skipped"
+    result, images = q.describe_evidence()
+    assert result["views"][0]["source_sequence"] == 2
+    assert result["views"][0]["label_counts"] == {}
+    assert images[0]["context"]["frame_id"] == result["views"][0]["frame_id"]
+    assert images[0]["context"]["frame_id"] != first["frame_id"]
+    assert images[0]["context"]["source"] == "live_cache"
+    r, g, b = Image.open(io.BytesIO(images[0]["jpeg"])).getpixel((20, 20))
+    assert b > 200 and r < 20 and g < 20
+    assert len(list(runtime.config.root.glob("images/**/*.jpg"))) == 1
+
+
+def test_detector_failure_does_not_prevent_visual_scene_analysis(runtime):
+    runtime.ingest(observation(detection_status="unavailable", detections=[]), jpeg())
+    result, images = BackendQuery(runtime).describe_evidence()
+    assert result["status"] == "detection_unavailable"
+    assert len(images) == 1
+    assert result["visual_review"]["status"] == "required"
+    assert result["visual_review"]["performed"] is False
+
+
+def test_search_attaches_bounded_unverified_images_and_handles_missing_evidence(
+    runtime,
+):
+    q = BackendQuery(runtime)
+    ids = [
+        runtime.ingest(observation(i, i * 1_000_000_000, x=i), jpeg())["frame_id"]
+        for i in range(1, 6)
+    ]
+    wait_for(lambda: runtime.health()["indexed_frames"] == 5)
+    result, images = q.search_evidence(
+        query="a fire truck", top_k=5, group_results=False
+    )
+    assert result["candidate_only"] is True
+    assert len(result["matches"]) == 5 and len(images) == 3
+    assert all(
+        row["visual_verification"] == "not_performed" for row in result["matches"]
+    )
+    assert [row["image_evidence"]["status"] for row in result["matches"]] == [
+        "attached"
+    ] * 3 + ["omitted_limit"] * 2
+    # A missing historical JPEG must not turn ranking into visual confirmation.
+    image_path = q.get_frame(ids[0])["image_path"]
+    (runtime.config.root / image_path).unlink()
+    result, images = q.search_evidence(
+        query="a fire truck", top_k=5, group_results=False
+    )
+    row = next(row for row in result["matches"] if row["frame_id"] == ids[0])
+    assert row["image_evidence"]["status"] == "unavailable"
+    assert row["visual_verification"] == "not_performed"
+    result, images = q.search_evidence(query="a fire truck", include_images=False)
+    assert not images and result["visual_review"]["status"] == "not_requested"
+
+
+def test_stale_image_cannot_be_misrepresented_as_current(runtime):
+    old = "2001-01-01T00:00:00+00:00"
+    runtime.ingest(observation(captured_at=old), jpeg())
+    result, images = BackendQuery(runtime).describe_evidence()
+    assert result["status"] == "stale"
+    assert images[0]["context"]["stale"] is True
+    assert images[0]["context"]["captured_at"].startswith("2001-")
 
 
 def test_task_stop_preserves_live_cache(runtime):
@@ -331,6 +544,17 @@ def test_stdio_proxy_roundtrip_over_real_http(runtime):
                     assert not response.is_error
                     assert (
                         json.loads(response.content[0].text)["matches"][0]["frame_id"]
+                        == result["frame_id"]
+                    )
+                    assert any(item.type == "image" for item in response.content)
+                    assert (
+                        response.structured_content["visual_review"]["performed"]
+                        is False
+                    )
+                    response = await session.call_tool("describe_view", {})
+                    assert any(item.type == "image" for item in response.content)
+                    assert (
+                        response.structured_content["views"][0]["frame_id"]
                         == result["frame_id"]
                     )
                     response = await session.call_tool(
@@ -475,14 +699,16 @@ def test_backlog_low_disk_and_restart_recovery(tmp_path):
         dict(session_id="s1", coordinate_id="c1", task_id="task1", state="running")
     )
     first = r.ingest(observation(), jpeg())
-    assert r.ingest(observation(2, 4_000_000_000), jpeg())["status"] == "overloaded"
+    assert (
+        r.ingest(observation(2, 4_000_000_000, x=1), jpeg())["status"] == "overloaded"
+    )
     assert BackendQuery(r).describe()["status"] == "ok"
     gate.set()
     wait_for(
         lambda: BackendQuery(r).get_frame(first["frame_id"])["radio_status"] == "ready"
     )
     r.config.min_free_bytes = 10**30
-    assert r.ingest(observation(3, 7_000_000_000), jpeg())["status"] == "low_disk"
+    assert r.ingest(observation(3, 7_000_000_000, x=2), jpeg())["status"] == "low_disk"
     r.close()
 
     # A pending image survives process/model failure and is recovered on restart.
@@ -493,7 +719,7 @@ def test_backlog_low_disk_and_restart_recovery(tmp_path):
     cfg.min_free_bytes = 0
     r = BackendRuntime(cfg, Broken)
     wait_for(lambda: r.model_state == "failed")
-    pending = r.ingest(observation(4, 10_000_000_000), jpeg())
+    pending = r.ingest(observation(4, 10_000_000_000, x=3), jpeg())
     assert pending["status"] == "accepted"
     r.close()
     r = BackendRuntime(cfg, Encoder)
@@ -510,8 +736,10 @@ def test_backlog_low_disk_and_restart_recovery(tmp_path):
 
 def test_ros_math_pairing_and_decoder_match_verified_parser():
     base = Path(__file__).resolve().parents[3]
-    candidates = [base / path / "src/semantic_perception/src" for path in (
-        "D360/slamibot_d360_framework", "0801/SLAMIBOT_D360_Framework")]
+    candidates = [
+        base / path / "src/semantic_perception/src"
+        for path in ("D360/slamibot_d360_framework", "0801/SLAMIBOT_D360_Framework")
+    ]
     bridge = next((path for path in candidates if path.exists()), candidates[0])
     if not bridge.exists():
         pytest.skip("framework adapter not checked out")

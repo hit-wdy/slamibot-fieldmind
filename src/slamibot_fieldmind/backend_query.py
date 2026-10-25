@@ -16,6 +16,18 @@ from .keyframes import rotation_deg
 from .query import parse_time, verification_target
 from .semantic_store import connect, payload
 from .store import RecordStore
+from .visual_evidence import attach_visual_evidence
+
+
+def render_jpeg(source, max_edge=1280, detections=None):
+    with Image.open(source) as original:
+        image = original.convert("RGB")
+        image.thumbnail((max_edge, max_edge))
+        if detections is not None:
+            draw_detections(image, detections)
+        output = io.BytesIO()
+        image.save(output, format="JPEG", quality=85)
+        return output.getvalue()
 
 
 def freshness(stamp, max_age_s):
@@ -306,6 +318,17 @@ class BackendQuery:
             )
             return result
 
+    def search_evidence(self, *, include_images=True, max_edge=1280, **arguments):
+        result = self.search(**arguments)
+        result["candidate_only"] = True
+        return attach_visual_evidence(
+            result,
+            result["matches"],
+            lambda row, edge: self.image(row["frame_id"], max_edge=edge),
+            include_images=include_images,
+            max_edge=max_edge,
+        )
+
     def image(self, frame_id, overlay=False, max_edge=1280):
         if not 64 <= max_edge <= 4096:
             raise ValueError("max_edge must be 64..4096")
@@ -315,14 +338,7 @@ class BackendQuery:
         path = (self.root / m["image_path"]).resolve()
         if not path.is_relative_to(self.root.resolve()):
             raise ValueError("image path escapes record root")
-        with Image.open(path) as source:
-            image = source.convert("RGB")
-            image.thumbnail((max_edge, max_edge))
-            if overlay:
-                draw_detections(image, m["detections"])
-            output = io.BytesIO()
-            image.save(output, format="JPEG", quality=85)
-        return output.getvalue()
+        return render_jpeg(path, max_edge, m["detections"] if overlay else None)
 
     def compare_frames(self, frame_ids):
         if not 2 <= len(frame_ids) <= 50:
@@ -370,6 +386,7 @@ class BackendQuery:
         device_id=None,
         max_age_s=5,
         place_id=None,
+        _snapshots=None,
     ):
         freshness(dt.datetime.now(dt.timezone.utc).isoformat(), max_age_s)
         if device_id is not None:
@@ -378,6 +395,14 @@ class BackendQuery:
             if location_label or place_id:
                 raise ValueError("use location mode for a place")
             with self.runtime.lock:
+                if _snapshots is not None:
+                    _snapshots.update(
+                        {
+                            m["frame_id"]: jpeg
+                            for cid, (m, jpeg) in self.runtime.live.items()
+                            if camera_id is None or cid == camera_id
+                        }
+                    )
                 rows = [
                     dict(m)
                     for cid, (m, _) in self.runtime.live.items()
@@ -438,6 +463,27 @@ class BackendQuery:
             radio_used=False,
             source="live_cache" if mode == "current" else "latest_record",
             caveat="YOLO class inventory within its ROI. Counts are per view, not unique objects. Historical place observations do not describe the present.",
+        )
+
+    def describe_evidence(self, *, include_images=True, max_edge=1280, **arguments):
+        # Snapshot JPEG and metadata in the same lock. A current observation may
+        # have been skipped by keyframe sampling and have no historical file.
+        snapshots = {}
+        result = self.describe(
+            _snapshots=snapshots if include_images else None, **arguments
+        )
+
+        def load(row, edge):
+            if result["mode"] == "current":
+                return render_jpeg(io.BytesIO(snapshots[row["frame_id"]]), edge)
+            return self.image(row["frame_id"], max_edge=edge)
+
+        return attach_visual_evidence(
+            result,
+            result["views"],
+            load,
+            include_images=include_images,
+            max_edge=max_edge,
         )
 
     def status(self):

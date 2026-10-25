@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from mcp.server.mcpserver import MCPServer
-from mcp.types import ImageContent
+from mcp.types import CallToolResult, ImageContent, TextContent
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -21,11 +21,33 @@ from .keyframes import KeyframePolicy
 from .protocol import MAX_JPEG_BYTES
 
 
+def multimodal_result(result, images):
+    content = [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+    for image in images:
+        content.append(
+            TextContent(
+                type="text",
+                text="VISUAL_EVIDENCE "
+                + json.dumps(image["context"], ensure_ascii=False),
+            )
+        )
+        content.append(
+            ImageContent(
+                type="image",
+                mime_type="image/jpeg",
+                data=base64.b64encode(image["jpeg"]).decode(),
+            )
+        )
+    return CallToolResult(content=content, structured_content=result)
+
+
 def build_backend_mcp(service):
     server = MCPServer(
         name="slamibot-fieldmind",
         instructions=(
-            "Visual memory of a mobile robot. Current view comes from the continuous YOLO cache; never open the camera. "
+            "Visual memory of a mobile robot. describe_view returns atomic current image/YOLO snapshots; never open the camera. "
+            "search_frames and describe_view include raw evidence images by default. The calling multimodal agent MUST inspect them before confirming objects or describing a scene. "
+            "Reject visually mismatched retrievals even when they rank first. If none match, report no confirmed evidence among reviewed candidates. "
             "Use list_sessions and list_places for coordinate scope. Positions locate the camera that saw an object, not its 3D position. "
             "RADIO cosine is not a probability; unsupported objects return best ranked candidates. Check stale and sync_quality. "
             "Use detections and label_counts for filtered class evidence. detections_original and detections_raw are audit evidence; "
@@ -34,7 +56,7 @@ def build_backend_mcp(service):
     )
 
     @server.tool(
-        description="Rank keyframes using RADIO, then cross-check the intended COCO object class using same-frame YOLO. Cosine is not a probability. Missing YOLO evidence is not proof of absence. English visual phrases are recommended. Spatial filters require an explicit coordinate session."
+        description="Retrieve historical candidates with RADIO and YOLO class evidence, plus up to 3 raw images by default. These are UNVERIFIED candidates: inspect images to confirm the requested object, attributes and counts; reject mismatches. Highest cosine does not imply existence. If none match, say no confirmed evidence in reviewed candidates, not absence everywhere. English query phrases are recommended."
     )
     def search_frames(
         query: str,
@@ -57,9 +79,11 @@ def build_backend_mcp(service):
         y: float | None = None,
         z: float | None = None,
         frame: str | None = None,
-    ) -> dict:
+        include_images: bool = True,
+        max_edge: int = 1280,
+    ) -> CallToolResult:
         values = {k: v for k, v in locals().items() if k != "service"}
-        return service.search(**values)
+        return multimodal_result(*service.search_evidence(**values))
 
     @server.tool(
         description="Metadata-only lookup of keyframes, including pending/failed RADIO. YOLO labels are evidence, not proof of presence or absence."
@@ -86,7 +110,7 @@ def build_backend_mcp(service):
         )
 
     @server.tool(
-        description="Return current YOLO cache (mode=current), or latest saved observations at a registered place (mode=location). No RADIO inference. Quote captured_at and stale; historical observations do not describe the present. Counts are per view."
+        description="Return current raw images and same-observation YOLO metadata (mode=current), or latest historical views at a place (mode=location). Up to 3 images included by default, even if no historical keyframe or YOLO failed. Describe the full image with your vision capability, then distinguish YOLO detections and disagreements. Check captured_at/stale. No RADIO or VLM runs inside this tool."
     )
     def describe_view(
         mode: str = "current",
@@ -95,8 +119,14 @@ def build_backend_mcp(service):
         device_id: str | None = None,
         max_age_s: float = 5,
         place_id: str | None = None,
-    ) -> dict:
-        return service.describe(**{k: v for k, v in locals().items() if k != "service"})
+        include_images: bool = True,
+        max_edge: int = 1280,
+    ) -> CallToolResult:
+        return multimodal_result(
+            *service.describe_evidence(
+                **{k: v for k, v in locals().items() if k != "service"}
+            )
+        )
 
     @server.tool(
         description="Full keyframe detail, camera/body pose, synchronization quality, detection status, RADIO job state and image reference."
@@ -251,6 +281,18 @@ def main(argv=None):
     p.add_argument("--rotation-deg", type=float, default=15)
     p.add_argument("--max-interval-s", type=float, default=3)
     p.add_argument("--min-interval-s", type=float, default=0.5)
+    p.add_argument(
+        "--timeout-distance-m",
+        type=float,
+        default=0.05,
+        help="minimum translation for time-triggered keyframes; suppresses static jitter",
+    )
+    p.add_argument(
+        "--timeout-rotation-deg",
+        type=float,
+        default=2,
+        help="minimum 3D rotation for time-triggered keyframes",
+    )
     args = p.parse_args(argv)
     from .config import Config
     from .encoder import AlignedEncoder
@@ -267,6 +309,8 @@ def main(argv=None):
                 args.rotation_deg,
                 args.max_interval_s,
                 args.min_interval_s,
+                args.timeout_distance_m,
+                args.timeout_rotation_deg,
             ),
         ),
         lambda: AlignedEncoder(cfg),

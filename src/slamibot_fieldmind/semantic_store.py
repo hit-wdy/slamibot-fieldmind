@@ -16,7 +16,7 @@ from pathlib import Path
 
 from .detection_types import Detection
 from .pose import Pose
-from .protocol import utcnow
+from .protocol import observation_key, utcnow
 from .store import RecordStore, SCHEMA, SCHEMA_VERSION
 
 SEMANTIC_SCHEMA = """
@@ -102,11 +102,35 @@ class ObservationStore:
             )
         self.db.executescript(SCHEMA + SEMANTIC_SCHEMA)
         row = self.db.execute("SELECT version FROM semantic_schema").fetchone()
-        if row and row[0] != 1:
+        if row and row[0] not in (1, 2):
             self.db.close()
             raise RuntimeError("unsupported semantic schema version")
-        if not row:
-            self.db.execute("INSERT INTO semantic_schema VALUES (1)")
+        # Version 2 separates retry identity from human-readable frame IDs.
+        # Backfill incrementally; never rename historical images or vectors.
+        if not row or row[0] == 1:
+            self.db.execute("BEGIN IMMEDIATE")
+            with self.db:
+                self.db.execute(
+                    "ALTER TABLE observations ADD COLUMN observation_key TEXT"
+                )
+                for old in self.db.execute(
+                    "SELECT frame_id,metadata_json FROM observations"
+                ):
+                    m = json.loads(old["metadata_json"])
+                    if all(
+                        k in m for k in ("device_id", "source_id", "source_sequence")
+                    ):
+                        self.db.execute(
+                            "UPDATE observations SET observation_key=? WHERE frame_id=?",
+                            (observation_key(m), old["frame_id"]),
+                        )
+                self.db.execute(
+                    "CREATE UNIQUE INDEX obs_identity ON observations(collection_id,observation_key)"
+                )
+                if row:
+                    self.db.execute("UPDATE semantic_schema SET version=2")
+                else:
+                    self.db.execute("INSERT INTO semantic_schema VALUES (2)")
         self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self.db.commit()
         self.vectors = None
@@ -152,7 +176,7 @@ class ObservationStore:
 
     def _insert(self, m, image_path, status):
         self.db.execute(
-            "INSERT INTO observations(frame_id,collection_id,session_id,coordinate_id,task_id,camera_id,captured_at,source_stamp_ns,image_path,radio_status,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO observations(frame_id,collection_id,session_id,coordinate_id,task_id,camera_id,captured_at,source_stamp_ns,image_path,radio_status,metadata_json,observation_key) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 m["frame_id"],
                 self.collection_id,
@@ -165,6 +189,7 @@ class ObservationStore:
                 image_path,
                 status,
                 json.dumps(m, ensure_ascii=False, allow_nan=False),
+                m.get("observation_key"),
             ),
         )
 
@@ -176,7 +201,7 @@ class ObservationStore:
         return payload(row) if row else None
 
     def accept(self, m, jpeg):
-        existing = self.get(m["frame_id"])
+        existing = self.get_observation(m["observation_key"])
         if existing:
             return existing
         path = self.root / "images" / m["frame_id"][:5] / (m["frame_id"] + ".jpg")
@@ -190,6 +215,13 @@ class ObservationStore:
         with self.db:
             self._insert(m, path.relative_to(self.root).as_posix(), "pending")
         return self.get(m["frame_id"])
+
+    def get_observation(self, key):
+        row = self.db.execute(
+            "SELECT * FROM observations WHERE observation_key=? AND collection_id=?",
+            (key, self.collection_id),
+        ).fetchone()
+        return payload(row) if row else None
 
     def bind_encoder(self, encoder):
         if self.vectors is None:

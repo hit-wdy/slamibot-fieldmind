@@ -8,7 +8,7 @@ import queue
 import shutil
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from PIL import Image
@@ -115,8 +115,11 @@ class BackendRuntime:
             low_disk=0,
             failed=0,
             overdue_gaps=0,
+            stationary_skipped=0,
+            time_only_accepted=0,
         )
         self.latest_selection = None
+        self.sampling_blocked = {}
         self.fingerprint = None
         self.latencies = []
         self.thread = threading.Thread(
@@ -263,7 +266,7 @@ class BackendRuntime:
                     del self.live[next(iter(self.live))]
 
         def write(s):
-            existing = s.get(m["frame_id"])
+            existing = s.get_observation(m["observation_key"])
             if existing:
                 return "duplicates", existing
             session = s.db.execute(
@@ -286,6 +289,7 @@ class BackendRuntime:
                 m["source_stamp_ns"],
                 m.get("camera_pose"),
                 json.loads(last[0]) if last else None,
+                body_pose=m.get("body_pose"),
             )
             m["selection"] = decision
             if not decision["reasons"]:
@@ -308,10 +312,20 @@ class BackendRuntime:
         kind, result = self.writer.call(write)
         with self.lock:
             self.metrics[kind] += 1
+            selection_status = result.get("selection", {}).get("status")
+            if kind == "skipped" and selection_status == "stationary":
+                self.metrics["stationary_skipped"] += 1
+            if kind == "accepted" and selection_status == "pose_unavailable":
+                self.metrics["time_only_accepted"] += 1
+            if kind in {"overloaded", "low_disk"}:
+                self.sampling_blocked[m["camera_id"]] = True
+                if len(self.sampling_blocked) > 8:
+                    del self.sampling_blocked[next(iter(self.sampling_blocked))]
             if kind == "accepted":
                 self.latest_selection = utcnow()
                 if (
-                    (result.get("selection", {}).get("interval_s") or 0)
+                    self.sampling_blocked.pop(m["camera_id"], False)
+                    and (result.get("selection", {}).get("interval_s") or 0)
                     > self.config.policy.max_interval_s
                     + self.config.policy.min_interval_s
                 ):
@@ -427,6 +441,7 @@ class BackendRuntime:
             latest_keyframe_accepted_at=self.latest_selection,
             disk_free_bytes=shutil.disk_usage(self.config.root).free,
             pending_limit=self.config.pending_limit,
+            keyframe_policy=asdict(self.config.policy),
             latency=percentiles,
             vector_partitions_ok=integrity["ok"],
             integrity_problems=integrity["orphan_or_missing"],

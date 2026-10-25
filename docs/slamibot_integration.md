@@ -19,16 +19,16 @@ flowchart TB
     end
     subgraph SERVICE["独立视觉后端"]
         HTTP["本机 HTTP 接口"] --> LIVE["当前 YOLO 缓存"]
-        HTTP --> SELECT["0.5m／15°／3s，最小间隔 0.5s"]
+        HTTP --> SELECT["0.5m／15°；3s＋有效运动<br/>静止不补帧，最小间隔 0.5s"]
         SELECT --> DB["JPEG＋观测表：pending"]
         DB --> RADIO["共享 RADIO 图文模型"]
         RADIO --> READY["向量分区＋ready 状态"]
-        LIVE --> QUERY["查询服务"]
+        LIVE --> QUERY["查询服务：元数据＋原图"]
         READY --> QUERY
         QUERY --> MCP["9 个 MCP 工具"]
     end
     BRIDGE --> HTTP
-    MCP --> AGENT[Agent]
+    MCP --> AGENT["多模态 Agent：看图核验／场景分析"]
 ```
 
 ROS 节点不导入 PyTorch、RADIO 或 MCP，网络发送不占用图像回调。后端不导入 DepthAI，
@@ -178,12 +178,22 @@ T_world_camera = T_world_body × T_body_lidar × inverse(T_camera_lidar)
 
 位姿存在时提供 `x/y/z/qx/qy/qz/qw/frame/source`，四元数按 xyzw；真实桥接的 source 为
 `slam`。`captured_at` 仅在原始时钟可解释为 UTC 时提供，否则使用接收时间展示，
-原始纳秒时间保留。帧 ID 包含会话、坐标会话、设备、相机、驱动启动 ID 和原始序号，
-同一帧重试不重复写入。
+原始纳秒时间保留。帧 ID 为 `kf-<32位哈希>-<YYYYMMDDTHHMMSSmmmZ>`，例如
+`kf-93b922c324faa6b2d04cf1e95ba96a35-20261025T010807123Z`。
+哈希来自会话、坐标会话、设备、相机、驱动启动 ID 和原始序号；时间取采集 UTC，
+缺失时取接收 UTC。独立的 `observation_key` 唯一索引负责去重，即使重试接收时间变化，
+也返回首次保存的编号、图片和记录。观测表版本 1 自动迁移到 2，旧编号和图片不改名。
+
+选帧以最近一张**已持久化接受**的关键帧为基准，首帧立即接受。随后满足最小间隔
+0.5 秒，平移 ≥0.5 米或旋转 ≥15° 触发；3 秒超时补帧还要求平移 ≥0.05 米或旋转 ≥2°，
+静止及阈值内抖动不补帧。相机位姿不可比较时可使用同一坐标系的两帧机身位姿判断运动，
+相机位姿仍保持缺失；没有可比较位姿时按时间采样，不能宣称已过滤静止场景。
+参数、状态和边界见 [关键帧策略](keyframe_policy.md)。
 
 MCP 共 9 个工具：原有 `search_frames`、`find_frames`、`describe_view`、`get_frame`、
 `compare_frames`、`index_status`，以及 `get_frame_image`、`list_sessions`、`list_places`。
 语义检索继续保持 RADIO 排序，然后增加同帧 YOLO 类别证据；不支持的类别返回 RADIO 候选。
+`search_frames`、`describe_view` 默认以 MCP `CallToolResult` 返回首条 JSON、逐图上下文文字与原图 `ImageContent`，并提供相同的 `structuredContent`。最多自动附 3 张图、最长边 1280 像素；可通过 `include_images=false` 关闭。当前图片与元数据在同一锁内取快照，无须成为历史关键帧，检测失败时也可返回图片。后端不增加 VLM，`visual_review.performed=false` 明确表示应由调用侧多模态 Agent 完成核验；最高相似度不是存在性证明。详见 [多模态证据与核验](multimodal_review.md)。
 文字检索推荐英文，余弦不是存在概率。支持任务、会话、地点、参考帧及显式坐标半径过滤。
 
 登记地点示例：
