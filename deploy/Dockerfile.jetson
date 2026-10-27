@@ -1,5 +1,17 @@
-# Select the base only after comparing the device's L4T with NVIDIA's matrix.
-# No default: a container does not make an incompatible CUDA driver compatible.
+# FieldMind inference image for Jetson (aarch64, NVIDIA container runtime).
+#
+# Pick BASE_IMAGE from the L4T release actually installed on the device. There is
+# no default on purpose: a container cannot make an incompatible CUDA driver
+# compatible, and this repository's pyproject demands torch>=2.8 which no
+# JetPack 5.x image provides (see docs/orin_nx_deployment_validation.md).
+#
+#   JetPack 6.x (L4T r36):  nvcr.io/nvidia/l4t-pytorch:r36.4.0-pth2.5-py3
+#   JetPack 5.x (L4T r35):  no torch>=2.8 build exists; run this backend on the
+#                           host with the CPU fallback instead of this image.
+#
+# Build from the repository root:
+#   docker build -f deploy/Dockerfile.jetson -t slamibot-fieldmind:jetson-local \
+#     --build-arg BASE_IMAGE=nvcr.io/nvidia/l4t-pytorch:r36.4.0-pth2.5-py3 .
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 WORKDIR /opt/slamibot-fieldmind
@@ -10,9 +22,12 @@ COPY models/assets.json ./models/assets.json
 COPY third_party/RADIO ./third_party/RADIO
 COPY scripts ./scripts
 # Refuse CPU/x86 images and unsupported framework versions before resolving deps.
-RUN python3 -c "import platform,torch; assert platform.machine()=='aarch64'; assert torch.version.cuda; assert tuple(map(int,torch.__version__.split('+')[0].split('.')[:2])) >= (2,8)"
+RUN python3 -c "import platform,torch; assert platform.machine()=='aarch64'; assert tuple(map(int,torch.__version__.split('+')[0].split('.')[:2])) >= (2,8), 'base torch is too old; pick a JetPack 6 base'"
 RUN python3 -c "import importlib.metadata as m; print('torch=='+m.version('torch')); print('torchvision=='+m.version('torchvision'))" > /tmp/base-constraints.txt
 RUN python3 -m pip install --no-cache-dir -c /tmp/base-constraints.txt -e '.[backend]'
 ENV HF_HUB_OFFLINE=1
 ENV HF_HUB_DISABLE_TELEMETRY=1
-CMD ["python3", "-m", "slamibot_fieldmind.backend", "--model-config", "configs/jetson.yaml"]
+# Orin NX shares CPU and GPU memory; leave headroom for SLAM and navigation.
+ENV OMP_NUM_THREADS=6
+ENV MKL_NUM_THREADS=6
+CMD ["python3", "-m", "slamibot_fieldmind.backend", "--root", "/data/semantic_index", "--mount-path", "/data", "--model-config", "configs/jetson.yaml"]

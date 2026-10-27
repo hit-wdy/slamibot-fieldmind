@@ -19,8 +19,6 @@ from typing import Any, Iterator
 
 import numpy as np
 
-import depthai as dai
-
 DEFAULT_RESOLUTION = (1024, 576)
 # CAM_A on an OAK-4P-New is a wide, strongly distorted lens; the full field of
 # view is kept because retrieval has to see the whole scene (spec section 13).
@@ -65,11 +63,32 @@ class Frame:
         return float((self.image >= 250).all(axis=-1).mean())
 
 
+def depthai():
+    """Import DepthAI on demand.
+
+    The device deployment path (ROS bridge -> HTTP ingest) never opens the OAK:
+    the SLAMIBOT driver owns the camera and the OAK runtime there is DepthAI
+    2.30, which cannot share this package's environment. Keeping the import lazy
+    lets the backend, MCP proxy and test suite run on a host without DepthAI.
+    """
+    try:
+        import depthai as dai
+    except ImportError as error:
+        raise ImportError(
+            "depthai is required only for the standalone OAK capture path; install "
+            "the 'oak' extra in a DepthAI 2.30-compatible environment, or feed the "
+            "backend from the ROS bridge instead of opening the camera here"
+        ) from error
+    return dai
+
+
 def list_devices() -> list[str]:
+    dai = depthai()
     return [info.getDeviceId() for info in dai.Device.getAllAvailableDevices()]
 
 
 def _discover_one_device(selector: str | None) -> Any:
+    dai = depthai()
     devices = dai.Device.getAllAvailableDevices()
     if selector:
         matches = [d for d in devices if d.getDeviceId() == selector]
@@ -106,6 +125,7 @@ def wait_for_device(selector: str | None, timeout: float) -> Any:
 
 def open_device(selector: str | None, usb_speed: str, timeout: float = 30.0, attempts: int = 3) -> Any:
     """Boot the device, retrying the transient failures seen on first enumeration."""
+    dai = depthai()
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
         info = wait_for_device(selector, timeout=timeout)
@@ -198,6 +218,7 @@ class CameraSource:
     def open(self) -> "CameraSource":
         if self._pipeline is not None:
             return self
+        dai = depthai()
         self._device = open_device(self.device_id, self.usb_speed)
         socket = getattr(dai.CameraBoardSocket, self.socket)
         available = {feature.socket for feature in self._device.getConnectedCameraFeatures()}

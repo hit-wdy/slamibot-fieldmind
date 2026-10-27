@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import math
+import os
 import queue
 import shutil
 import threading
@@ -27,6 +28,11 @@ class BackendConfig:
     pending_limit: int = 32
     inference_queue_size: int = 4
     require_mount: bool = True
+    # When require_mount is set, the data root must live on a mounted volume other
+    # than the root filesystem. The old check hard-coded /mnt/usb, which rejected
+    # NVMe or relocated data roots even though they were separate, durable mounts.
+    # `None` means /mnt/usb, kept for the existing deployment layout.
+    mount_path: Path | None = None
     policy: KeyframePolicy = field(default_factory=KeyframePolicy)
 
     def __post_init__(self):
@@ -38,6 +44,27 @@ class BackendConfig:
             or not 1 <= self.inference_queue_size <= 4
         ):
             raise ValueError("invalid backend capacity")
+
+    @property
+    def required_mount(self) -> Path:
+        return Path(self.mount_path) if self.mount_path is not None else Path("/mnt/usb")
+
+    def data_root_is_mounted(self) -> bool:
+        """True when the data root sits on a mount other than `/` itself.
+
+        Docker bind mounts and bind-mounted subdirectories of a real volume are
+        accepted; the point is only to refuse writing history onto the root
+        filesystem, not to demand one specific path.
+        """
+        if not os.path.ismount(self.required_mount):
+            return False
+        root = self.root
+        while True:
+            if root == self.required_mount or self.required_mount in root.parents:
+                return True
+            if root.parent == root:
+                return False
+            root = root.parent
 
 
 class Writer:
@@ -86,9 +113,11 @@ class Writer:
 class BackendRuntime:
     def __init__(self, config=None, encoder_factory=None):
         self.config = config or BackendConfig()
-        if self.config.require_mount and not Path("/mnt/usb").is_mount():
+        if self.config.require_mount and not self.config.data_root_is_mounted():
             raise RuntimeError(
-                "/mnt/usb must be mounted; refusing to write to the root filesystem"
+                f"{self.config.required_mount} must be mounted and must contain the data root "
+                f"{self.config.root}; refusing to write to the root filesystem. Pass --root on the "
+                "mounted volume (or --mount-path/--allow-unmounted) instead."
             )
         self.config.root.mkdir(parents=True, exist_ok=True)
         self.owner_lock = BackendLock(self.config.root)
@@ -368,6 +397,32 @@ class BackendRuntime:
 
         return self.writer.call(write)
 
+    def environment(self) -> dict:
+        """Report what actually loaded, not what the config asked for.
+
+        Device acceptance has to distinguish "bf16 on GPU" from "float32 on CPU
+        because no CUDA torch matched this L4T release"; otherwise a degraded
+        deployment looks identical to a healthy one in health output.
+        """
+        encoder = self.encoder
+        if encoder is None:
+            return {"model_state": self.model_state}
+        report = getattr(encoder, "load_report", None)
+        environment = dict(getattr(encoder, "environment", {}) or {})
+        if report is not None:
+            environment.update(
+                device=report.device,
+                text_encoder_device=report.text_encoder_device,
+                model_dtype=report.model_dtype,
+                text_encoder_dtype=report.text_encoder_dtype,
+                checkpoint_dtype=report.checkpoint_dtype,
+            )
+        return environment
+
+    def model_warnings(self) -> list[str]:
+        report = getattr(self.encoder, "load_report", None)
+        return list(getattr(report, "warnings", []) or []) if report else []
+
     def health(self):
         def read(s):
             states = {
@@ -443,6 +498,8 @@ class BackendRuntime:
             pending_limit=self.config.pending_limit,
             keyframe_policy=asdict(self.config.policy),
             latency=percentiles,
+            environment=self.environment(),
+            model_warnings=self.model_warnings(),
             vector_partitions_ok=integrity["ok"],
             integrity_problems=integrity["orphan_or_missing"],
             stores_images=True,

@@ -1,0 +1,63 @@
+# GPU encoder sidecar for JetPack 5 (Orin NX).
+#
+# Why a sidecar instead of one process: on L4T 35.x the only CUDA-enabled torch
+# wheels NVIDIA publishes are CPython 3.8, while the MCP backend needs CPython
+# 3.10+. Two interpreters, one model, joined by a loopback HTTP protocol.
+#
+# Prepare the interpreter once (see docs/orin_nx_gpu_encoder.md):
+#   python3.8 -m venv /home/jetson/wdy/.venvs/fm-gpu
+#   .../bin/pip install torch-2.1.0a0+41361538.nv23.06-cp38-cp38-linux_aarch64.whl
+#
+# Then, from the repository root:
+#   sudo setcap -n 0 cap_sys_nice+ep ... (optional, see the doc)
+#   bash scripts/start_encoder_sidecar.sh
+services:
+  fieldmind-encoder:
+    image: ${FIELDMIND_ENCODER_IMAGE:-slamibot-fieldmind-encoder:jetson-local}
+    container_name: fieldmind-encoder
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+      - HF_HUB_OFFLINE=1
+      - HF_HUB_DISABLE_TELEMETRY=1
+      - OMP_NUM_THREADS=${FIELDMIND_OMP_THREADS:-6}
+      - LD_LIBRARY_PATH=/usr/local/cuda-11.4/lib64
+    volumes:
+      - ${FIELDMIND_ROOT:-./..}/configs:/app/configs:ro
+      - ${FIELDMIND_ROOT:-./..}/models:/app/models:ro
+      - ${FIELDMIND_ROOT:-./..}/third_party/RADIO:/app/third_party/RADIO:ro
+    working_dir: /opt/slamibot-fieldmind
+    command:
+      - python3
+      - -m
+      - slamibot_fieldmind.encoder_service
+      - --model-config
+      - configs/jetson-gpu.yaml
+      - --host
+      - 127.0.0.1
+      - --port
+      - "8791"
+    # The GPU is shared with SLAM and navigation; this only reserves the model.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8791/health', timeout=5).status==200 else 1)"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s

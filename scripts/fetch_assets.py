@@ -34,6 +34,24 @@ def load_manifest() -> dict:
     return json.loads(MANIFEST.read_text(encoding="utf-8"))
 
 
+def endpoint_url(url: str) -> str:
+    """Route Hugging Face URLs through `HF_ENDPOINT` when one is configured.
+
+    The manifest pins publisher URLs so the origin is auditable, but a device
+    behind a network that blocks huggingface.co (common on the target Orin) still
+    needs the same bytes. `HF_ENDPOINT` is the same variable huggingface_hub
+    honours, so both asset kinds follow one switch. The SHA-256 check is what
+    authorises the download, not the host name.
+    """
+    endpoint = os.environ.get("HF_ENDPOINT", "").rstrip("/")
+    if not endpoint:
+        return url
+    prefix = "https://huggingface.co"
+    if url.startswith(prefix):
+        return endpoint + url[len(prefix) :]
+    return url
+
+
 def digest(path: Path) -> str:
     hasher = hashlib.sha256()
     with path.open("rb") as handle:
@@ -96,7 +114,7 @@ def fetch_http(asset: dict, dest: Path, attempts: int = 6) -> Path:
         headers = {"User-Agent": "slamibot-fieldmind-fetch/1.0"}
         if have:
             headers["Range"] = f"bytes={have}-"
-        request = urllib.request.Request(asset["url"], headers=headers)
+        request = urllib.request.Request(endpoint_url(asset["url"]), headers=headers)
         try:
             with urllib.request.urlopen(request, timeout=60) as response:
                 if have and response.status != 206:

@@ -10,6 +10,7 @@ download, and we keep the CLIP text tower off the GPU unless asked for it.
 from __future__ import annotations
 
 import hashlib
+import importlib.machinery
 import importlib.util
 import json
 import os
@@ -58,6 +59,7 @@ class LoadReport:
     model_dtype: str = ""
     device: str = ""
     text_encoder_device: str = ""
+    text_encoder_dtype: str = ""
     parameter_count: int = 0
     adaptor_names: list[str] = field(default_factory=list)
     adaptor_classes: dict[str, str] = field(default_factory=dict)
@@ -70,6 +72,7 @@ class LoadReport:
 
 def ensure_radio_importable() -> None:
     """Put the vendored RADIO root on `sys.path` so `import radio` resolves to it."""
+    _shim_torch_distributed()
     if not (RADIO_SOURCE / "radio" / "__init__.py").is_file():
         raise FileNotFoundError(
             f"the vendored RADIO source is missing at {RADIO_SOURCE}; "
@@ -84,6 +87,70 @@ def ensure_radio_importable() -> None:
             f"a different 'radio' package was already imported from {getattr(module, '__file__', '?')}; "
             "import slamibot_fieldmind before anything else that ships a top-level 'radio' module"
         )
+
+
+def _shim_torch_distributed() -> None:
+    """Fill in the `torch.distributed` surface RADIO imports at module load.
+
+    NVIDIA's JetPack 5 aarch64 wheels are built with `USE_DISTRIBUTED=0`, so
+    `torch.distributed` exists but has no `is_initialized`/`get_rank` and no
+    `torch.distributed.nn.functional`. RADIO only uses those for multi-process
+    training (`rank_gate`, an all-reduce on the token count), never in the
+    single-process inference path we run, so no-op stand-ins are enough.
+    """
+    distributed = getattr(torch, "distributed", None)
+    if distributed is None:
+        return
+    if hasattr(torch._C, "_distributed_c10d"):
+        return
+
+    stubs = {
+        "is_available": lambda: False,
+        "is_initialized": lambda: False,
+        "get_rank": lambda group=None: 0,
+        "get_world_size": lambda group=None: 1,
+        "get_backend": lambda group=None: "undefined",
+        "destroy_process_group": lambda group=None: None,
+    }
+    for name, stub in stubs.items():
+        if not hasattr(distributed, name):
+            setattr(distributed, name, stub)
+    if not hasattr(distributed, "ReduceOp"):
+
+        class ReduceOp:  # noqa: D401 - mirrors torch.distributed.ReduceOp
+            SUM = 0
+            PRODUCT = 1
+            MIN = 2
+            MAX = 3
+            BAND = 4
+            BOR = 5
+            BXOR = 6
+            PREMUL_SUM = 7
+            AVG = 8
+
+        distributed.ReduceOp = ReduceOp
+
+    nn_package = sys.modules.get("torch.distributed.nn")
+    if nn_package is None:
+        nn_package = importlib.util.module_from_spec(
+            importlib.machinery.ModuleSpec("torch.distributed.nn", loader=None)
+        )
+        nn_package.__path__ = []
+        sys.modules["torch.distributed.nn"] = nn_package
+        distributed.nn = nn_package
+    functional = sys.modules.get("torch.distributed.nn.functional")
+    if functional is None:
+        # RADIO imports `all_reduce` at module level for the multi-process path
+        # only; in a single process it must be the identity, not a new group.
+        functional = importlib.util.module_from_spec(
+            importlib.machinery.ModuleSpec(
+                "torch.distributed.nn.functional", loader=None
+            )
+        )
+        functional.all_reduce = lambda tensor, *args, **kwargs: tensor
+        functional.all_gather = lambda tensor, *args, **kwargs: (tensor,)
+        sys.modules["torch.distributed.nn.functional"] = functional
+        nn_package.functional = functional
 
 
 def load_hubconf():
@@ -204,6 +271,25 @@ def _set_conditioner_dtype(model: Any, dtype: torch.dtype) -> None:
         conditioner.dtype = dtype
 
 
+def resolve_device(name: str) -> torch.device:
+    """Resolve `auto` against the runtime instead of failing on a CPU-only host.
+
+    A device that was flashed without the vendor CUDA runtime can still run the
+    index and MCP surface, just slowly. Silently pretending CUDA works would be
+    worse; the load report records the resolved device.
+    """
+    if str(name) == "auto":
+        return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device(name)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(
+            f"model.device is {name!r} but torch.cuda.is_available() is False. "
+            "Install a CUDA build of torch for this L4T release, or set "
+            "model.device: auto to run on CPU."
+        )
+    return device
+
+
 def load_radio_model(cfg: ModelConfig, verify: bool = True) -> tuple[Any, LoadReport]:
     """Load RADIO with its adaptor and place it on the configured devices."""
     report = LoadReport(
@@ -225,9 +311,29 @@ def load_radio_model(cfg: ModelConfig, verify: bool = True) -> tuple[Any, LoadRe
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        model, checkpoint = hubconf.radio_model(
-            version=cfg.version, progress=True, adaptor_names=cfg.adaptor, return_checkpoint=True
-        )
+        if cfg.text_encoder_load == "text_only":
+            # Build only the paired text tower. The adaptor otherwise constructs
+            # the full CLIP model (including the 2.5 GB visual tower) and deletes
+            # the visual half right away, which dominates the cold-start peak on
+            # shared-memory Orin hardware.
+            from .text_tower import text_only_open_clip
+
+            # Build in the checkpoint's float32 and cast once below, so a CPU
+            # fallback does not first build bfloat16 and then convert.
+            with text_only_open_clip():
+                model, checkpoint = hubconf.radio_model(
+                    version=cfg.version,
+                    progress=True,
+                    adaptor_names=cfg.adaptor,
+                    return_checkpoint=True,
+                )
+        else:
+            model, checkpoint = hubconf.radio_model(
+                version=cfg.version,
+                progress=True,
+                adaptor_names=cfg.adaptor,
+                return_checkpoint=True,
+            )
 
     report.warnings = [f"{w.category.__name__}: {w.message}" for w in caught]
     for warning in report.warnings:
@@ -270,12 +376,26 @@ def load_radio_model(cfg: ModelConfig, verify: bool = True) -> tuple[Any, LoadRe
 
     model.eval()
     report.checkpoint_dtype = str(checkpoint_dtype)
+
+    device = resolve_device(cfg.device)
+    text_device = resolve_device(cfg.text_encoder_device)
+    # Half precision is a GPU optimisation. On CPU it hits unvectorised slow
+    # paths (measured ~70 s/frame for bfloat16 versus ~5 s for float32 on Orin
+    # NX), so an `auto`/half request falls back to float32 there and says so.
     dtype = resolve_dtype(cfg.dtype, checkpoint_dtype)
+    if device.type == "cpu" and dtype in (torch.bfloat16, torch.float16):
+        report.warnings.append(
+            f"model.dtype {dtype} is not accelerated on CPU; using float32"
+        )
+        dtype = torch.float32
     report.model_dtype = str(dtype)
 
-    device = torch.device(cfg.device)
-    text_device = torch.device(cfg.text_encoder_device)
     text_dtype = DTYPE_BY_NAME[cfg.text_encoder_dtype]
+    if text_device.type == "cpu" and text_dtype in (torch.bfloat16, torch.float16):
+        report.warnings.append(
+            f"model.text_encoder_dtype {text_dtype} is not accelerated on CPU; using float32"
+        )
+        text_dtype = torch.float32
 
     # Take the CLIP text tower out of the module tree so `.to()` skips it, then
     # place it exactly where the config says. Leaving it in would drag 1.4 GB of
@@ -289,6 +409,7 @@ def load_radio_model(cfg: ModelConfig, verify: bool = True) -> tuple[Any, LoadRe
 
     report.device = str(device)
     report.text_encoder_device = str(text_device) if detached else str(device)
+    report.text_encoder_dtype = str(text_dtype)
     report.parameter_count = sum(p.numel() for p in model.parameters())
     model.requires_grad_(False)
     return model, report
