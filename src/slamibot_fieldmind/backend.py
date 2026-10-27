@@ -262,6 +262,25 @@ def create_app(runtime, host="127.0.0.1", close_runtime=True):
     return app
 
 
+def _encoder_factory(encoder_url, encoder_timeout, cfg, aligned_encoder_cls):
+    """Pick the in-process encoder or the GPU sidecar client.
+
+    A sidecar is the only way to use the GPU on JetPack 5, where the CUDA torch
+    wheels are CPython 3.8 and this backend needs CPython 3.10+.
+    """
+    if not encoder_url:
+        return lambda: aligned_encoder_cls(cfg)
+
+    from .remote_encoder import connect
+
+    def load():
+        # The sidecar has its own model config; the fingerprint check in
+        # `connect` plus `bind_encoder` refuse a collection from another space.
+        return connect(encoder_url, timeout=encoder_timeout)
+
+    return load
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
@@ -280,6 +299,19 @@ def main(argv=None):
         "--mount-path",
         type=Path,
         help="mounted volume that must contain --root (default: /mnt/usb)",
+    )
+    p.add_argument(
+        "--encoder-url",
+        help=(
+            "serve the model from an encoder sidecar at this URL instead of loading it "
+            "in-process (see python -m slamibot_fieldmind.encoder_service)"
+        ),
+    )
+    p.add_argument(
+        "--encoder-timeout",
+        type=float,
+        default=120,
+        help="seconds to wait for the sidecar to load and for each request",
     )
     p.add_argument("--min-free-gib", type=float, default=2)
     p.add_argument("--distance-m", type=float, default=0.5)
@@ -303,6 +335,7 @@ def main(argv=None):
     from .encoder import AlignedEncoder
 
     cfg = Config.from_yaml(args.model_config) if args.model_config else Config.default()
+    encoder_factory = _encoder_factory(args.encoder_url, args.encoder_timeout, cfg, AlignedEncoder)
     runtime = BackendRuntime(
         BackendConfig(
             root=args.root,
@@ -319,7 +352,7 @@ def main(argv=None):
                 args.timeout_rotation_deg,
             ),
         ),
-        lambda: AlignedEncoder(cfg),
+        encoder_factory,
     )
     import uvicorn
 

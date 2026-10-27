@@ -17,6 +17,7 @@ that by comparing against the full load in tests.
 from __future__ import annotations
 
 import contextlib
+import inspect
 import os
 from pathlib import Path
 from typing import Any
@@ -90,6 +91,15 @@ def _resolve_checkpoint(model_name: str, pretrained: str) -> Path:
     return Path(download_pretrained_from_hf(repo))
 
 
+def _pool_accepts_eos(text_global_pool: Any) -> bool:
+    """open_clip 3.x takes `eos_token_id`; 2.x does not and only pools by argmax."""
+    try:
+        parameters = inspect.signature(text_global_pool).parameters
+    except (TypeError, ValueError):
+        return False
+    return "eos_token_id" in parameters
+
+
 def _load_text_state(path: Path) -> dict[str, torch.Tensor]:
     """Read the checkpoint and drop every `visual.*` tensor.
 
@@ -128,7 +138,10 @@ class _TextOnlyCLIP(nn.Module):
         self.ln_final = text.ln_final
         self.text_projection = text.text_projection
         self.text_pool_type = text.pool_type
-        self.text_eos_id = text.eos_id
+        # open_clip 3.x exposes `pool_type='eos'` and `text.eos_id`; 2.x (the last
+        # release that still supports Python 3.8, which is what JetPack 5 ships
+        # GPU torch wheels for) only has 'argmax' and no `eos_id`.
+        self.text_eos_id = getattr(text, "eos_id", None)
         self.register_buffer("attn_mask", text.attn_mask, persistent=False)
         # Kept as an attribute so the adaptor's `oc_model.visual = None` is a
         # no-op rather than an AttributeError.
@@ -141,9 +154,12 @@ class _TextOnlyCLIP(nn.Module):
         x = x + self.positional_embedding.to(cast_dtype)
         x = self.transformer(x, attn_mask=self.attn_mask)
         x = self.ln_final(x)
-        x = self._text_global_pool(
-            x, text, self.text_pool_type, eos_token_id=getattr(self, "text_eos_id", None)
-        )
+        if _pool_accepts_eos(self._text_global_pool):
+            x = self._text_global_pool(
+                x, text, self.text_pool_type, eos_token_id=self.text_eos_id
+            )
+        else:
+            x = self._text_global_pool(x, text, self.text_pool_type)
         if self.text_projection is not None:
             if isinstance(self.text_projection, nn.Linear):
                 x = self.text_projection(x)

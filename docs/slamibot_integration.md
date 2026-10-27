@@ -250,10 +250,18 @@ python3 scripts/platform_probe.py --torch --out platform-inference.json
 如果设备版本无法提供这一组合，先保留已完成的代码和回放结果，单独处理推理环境兼容。
 
 实测限制：JetPack 5.x（L4T r35，Ubuntu 20.04／Python 3.8／CUDA 11.4 驱动）没有
-torch ≥2.8 的 aarch64 构建，GPU 推理无法满足本项目的依赖声明。此时 `configs/jetson.yaml`
-的 `device: auto` 会回退 CPU 并把实际设备写入 `/v1/health` 的 `environment`；
-CPU 可用但不满足实时索引目标。完整实测与修正见
-[Orin NX 实机部署验证](orin_nx_deployment_validation.md)。
+torch ≥2.8 的 aarch64 构建，也没有 Python ≥3.10 的 CUDA torch，因此**单进程内**无法同时
+满足后端（`mcp>=2.3` 需 Python ≥3.10）与 GPU 推理。
+
+已实测可行的方案是**双解释器侧车**：Python 3.8 进程持有 CUDA 11.4 torch 与模型，
+Python 3.11 后端通过 loopback HTTP 取向量（`--encoder-url`）。GPU `float32` 的
+fingerprint 与 CPU 完全相同，历史索引可直接复用；实测单帧 P50 1040 ms、关键帧 ready
+P50 1.54 s，达到 ≤3 s 目标。步骤见
+[Orin NX GPU 编码侧车](orin_nx_gpu_encoder.md)。
+
+回退仍保留：`configs/jetson.yaml` 的 `device: auto` 在无 CUDA torch 时回退 CPU，
+并把实际设备写入 `/v1/health` 的 `environment`；CPU 可用但不满足实时索引目标。
+完整实测与修正见 [Orin NX 实机部署验证](orin_nx_deployment_validation.md)。
 
 ```bash
 # BASE_IMAGE 必须是平台探测后选定的 NVIDIA ARM64 GPU 镜像（JetPack 6）。

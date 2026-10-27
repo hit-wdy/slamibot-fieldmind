@@ -1,0 +1,22 @@
+model:
+  backend: radio
+  version: radio_v2.5-b
+  adaptor: clip
+  checkpoint: models/hub/checkpoints/radio-v2.5-b_half.pth.tar
+  source_commit: 4ffaf15d0ff48197c194e306772bdb5fb92db230
+
+  # Use this config from the GPU encoder sidecar only. It runs under the CPython
+  # 3.8 interpreter that owns the JetPack 5 CUDA torch build, so it must not be
+  # handed to the 3.11 backend (which has no CUDA torch). The backend reaches the
+  # vectors over loopback: `--encoder-url http://127.0.0.1:8791`.
+  device: cuda:0
+  # float32 is not a luxury here: it is what makes the sidecar's fingerprint
+  # identical to the CPU path's (1a5b3804...), so collections recorded before the
+  # GPU was enabled stay readable. bfloat16 is ~4x faster (266 ms vs 1031 ms per
+  # 1024x576 frame) but changes the vector space, which forces a rebuild.
+  dtype: float32
+  text_encoder_load: text_only
+  text_encoder_device: cuda:0
+  text_encoder_dtype: float32
+  input_resolution: [512]
+  batch_size: 1

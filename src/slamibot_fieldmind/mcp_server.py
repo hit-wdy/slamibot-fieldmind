@@ -243,6 +243,15 @@ def build_server(service: QueryService, scene_service: SceneService | None = Non
     return server
 
 
+def _encoder_factory(args):
+    """The in-process encoder, or a client for the GPU sidecar on JetPack 5."""
+    if not args.encoder_url:
+        return AlignedEncoder
+    from .remote_encoder import connect
+
+    return lambda: connect(args.encoder_url, timeout=args.encoder_timeout)
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT, help="record root")
@@ -251,12 +260,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1", help="only for http transports")
     parser.add_argument("--port", type=int, default=8765, help="only for http transports")
     parser.add_argument("--preload-encoder", action="store_true", help="load the model at startup instead of on first text query")
+    parser.add_argument(
+        "--encoder-url",
+        help=(
+            "use an encoder sidecar at this URL instead of loading the model in-process "
+            "(see python -m slamibot_fieldmind.encoder_service)"
+        ),
+    )
+    parser.add_argument("--encoder-timeout", type=float, default=120)
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    service = QueryService(args.root, args.collection_id, encoder_factory=AlignedEncoder)
+    service = QueryService(
+        args.root, args.collection_id, encoder_factory=_encoder_factory(args)
+    )
     # Fail early with a clear message rather than at the first tool call.
     probe = service.status()
     print(

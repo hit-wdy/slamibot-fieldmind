@@ -2,7 +2,9 @@
 
 验证日期：2026-10-26。目标是按 [Orin NX 部署适配评估](orin_nx_deployment_assessment.md) 在本机完成部署验证。本文只记录**实测结果**与**修正**；评估文档中的建议若未被实测推翻，仍以评估为准。
 
-> 重要结论：本机实际是 **JetPack 5.1.4 / L4T 35.6.4**，不是评估文档假设的 JetPack 6.2。由此导致 `pyproject.toml` 声明的 `torch>=2.8`、Python ≥3.10 无法在 GPU 上满足。本次部署验证以 **CPU 回退路径**跑通端到端流程，并把 GPU 阻塞点、内存优化和可复现步骤全部固化到代码与本文。CPU 回退可支撑功能验收，但**不满足实时索引性能目标**。
+> 重要结论：本机实际是 **JetPack 5.1.4 / L4T 35.6.4**，不是评估文档假设的 JetPack 6.2。由此导致 `pyproject.toml` 声明的 `torch>=2.8`、Python ≥3.10 无法在**单一进程内**同时满足。本次部署验证先用 **CPU 回退路径**跑通端到端流程，随后用 **Python 3.8 GPU 编码侧车**打通 GPU 并达到实时目标——详见 [orin_nx_gpu_encoder.md](orin_nx_gpu_encoder.md)。CPU 回退仍作为无 GPU 时的兜底，但**不满足实时索引性能目标**。
+>
+> 2026-10-27 更新：GPU 路径已完成。单帧 P50 **1040 ms**（CPU 5939 ms），关键帧 ready P50 **1.54 s／P95 1.92 s**，`float32` fingerprint 与 CPU 完全相同，历史索引可直接复用。
 
 ## 一、实测环境基线
 
@@ -30,7 +32,7 @@ python3 scripts/platform_probe.py --out reports/platform_probe.json
 
 ## 二、关键问题与解决
 
-### 1. 镜像不是 JetPack 6.2，GPU 推理在当前宿主机不可用
+### 1. 镜像不是 JetPack 6.2，单进程内无法同时满足 torch 与 MCP 的版本要求
 
 **问题**：评估文档按 JetPack 6.2（L4T r36）设计，要求 torch ≥2.8。实测：
 
@@ -38,6 +40,7 @@ python3 scripts/platform_probe.py --out reports/platform_probe.json
 - NVIDIA 官方 JP5 redist 只有 `torch-2.1.0a0+...cp38`（Python 3.8／CUDA 11.4）。
 - PyTorch 官方 aarch64 wheel 在 `cu126` 下要求驱动 12.x，与本机 11.4 不兼容；`cu118` aarch64 轮子在官方源被 403 拒绝，镜像源仅有 x86_64。
 - `pypi.jetson-ai-lab` 的 `jp5` 索引已下线（404），只剩 `jp6`。
+- 即使接受 cp38 torch，`mcp>=2.3` 也要求 Python ≥3.10，两者无法共存于一个解释器。
 
 **处理**：
 
@@ -46,7 +49,9 @@ python3 scripts/platform_probe.py --out reports/platform_probe.json
 - `deploy/Dockerfile.jetson` 去掉无意义的 `ARG BASE_IMAGE` 默认值假设，改为明确要求选 JetPack 6 基础镜像，并注明 JP5 无 torch≥2.8 构建。
 - CPU 上 `bfloat16` 会走未向量化慢路径（实测 **70 s/帧**），因此加载器在 CPU 自动降级到 `float32` 并记录告警（实测 **5 s/帧**，快 14 倍）。
 
-**遗留**：要满足实时性能目标，需二者之一：升级到 JetPack 6.x 并安装匹配的 CUDA torch，或用现有 nav 容器的 CUDA 11.4 环境单独构建 cp38 torch 后端。本次未擅自升级宿主机。
+**已解决（2026-10-27）**：GPU 路径通过**双解释器侧车**打通——Python 3.8 进程持有 CUDA torch 11.4 与模型，Python 3.11 后端经 loopback HTTP 取向量。`float32` 下 GPU 与 CPU 的 fingerprint 完全相同，单帧 P50 从 5939 ms 降到 **1040 ms**。实现与实测见 [orin_nx_gpu_encoder.md](orin_nx_gpu_encoder.md)。
+
+**仍需**：若要把后端也放进单一容器，需要升级到 JetPack 6.x 并安装匹配的 CUDA torch，或自行用 CUDA 11.4 编译 cp311 torch。本次未擅自升级宿主机。
 
 ### 2. Hugging Face 直连不可达，模型无法下载
 
@@ -122,7 +127,9 @@ HF_ENDPOINT=https://hf-mirror.com python scripts/fetch_assets.py \
 | 重启恢复 | 杀进程重启后仍为 `states={'ready': 4}` |
 | 磁盘布局 | `records.sqlite`＋WAL、`images/kf-xx/*.jpg`、`vectors/`，与文档一致 |
 
-对照评估中的目标：**P95 当前缓存年龄 ≤1 s**（未测，需真实相机流）、**关键帧 ready ≤3 s**（CPU 为 10–15 s，**未达标**）、**SLAM 频率下降 ≤10%**（未测，需并机）。CPU 回退明确不满足实时目标。
+对照评估中的目标：**P95 当前缓存年龄 ≤1 s**（未测，需真实相机流）、**关键帧 ready ≤3 s**（CPU 为 10–15 s 未达标；GPU 侧车为 **P50 1.54 s／P95 1.92 s，已达标**）、**SLAM 频率下降 ≤10%**（未测，需并机）。CPU 回退不满足实时目标，GPU 侧车满足。
+
+GPU 侧车同一套冒烟（20 帧）实测：单帧 P50 **1040 ms**／P95 1060 ms，关键帧 ready P50 **1.54 s**／P95 **1.92 s**，`states={'ready': 20}`，fingerprint 与 CPU 相同。
 
 ### 稳定性与内存
 
@@ -134,7 +141,18 @@ HF_ENDPOINT=https://hf-mirror.com python scripts/fetch_assets.py \
 
 ## 四、当前建议的部署方式（在本机）
 
-在 GPU 推理不可用的前提下，功能验证与现场试运行使用宿主 CPU 路径：
+**推荐**：GPU 编码侧车 + 后端（实时目标已达标）。完整步骤与实测见 [orin_nx_gpu_encoder.md](orin_nx_gpu_encoder.md)。要点：
+
+```bash
+bash scripts/setup_gpu_encoder_env.sh --install-cuda-runtime   # 一次性
+bash scripts/start_encoder_sidecar.sh                          # 侧车，GPU
+.venv-jetson/bin/python -m slamibot_fieldmind.backend \
+  --root /mnt/usb/slamibot_record_data/semantic_index \
+  --model-config configs/jetson.yaml \
+  --encoder-url http://127.0.0.1:8791 --port 8765
+```
+
+**兜底**：无 GPU 时使用宿主 CPU 路径（功能可用，不满足实时目标）：
 
 ```bash
 cd /home/jetson/wdy/slamibot-fieldmind
@@ -165,12 +183,12 @@ HF_ENDPOINT=https://hf-mirror.com .venv-jetson/bin/python scripts/fetch_assets.p
 
 ## 五、仍需在真实硬件上完成的事项
 
-1. **GPU 路径**：升级到 JetPack 6.x 或用 CUDA 11.4 环境重编 cp38 torch 后，用 `configs/jetson.yaml` 的 `device: cuda:0` 复核真实吞吐与峰值。当前无 profiler 数据，不能引用 157 TOPS 推算。
+1. **GPU 扩展性**：GPU 路径已用侧车跑通（float32 单帧 P50 1040 ms，`bfloat16` 266 ms），但 `bfloat16` 会改变 fingerprint，需重建索引；是否值得换 4× 吞吐取决于现场帧率。真实相机帧率下的持续吞吐与温度未测。
 2. **单路实采**：本机 `/SLB_CAM_A/compressed` 无发布者，未接 OAK／SLAM；需接入真实 CAM_A、`/slam_pose`、RTK 后复测时间关联、外参与会话。
-3. **并机负载**：与 SLAM／导航共跑 30 分钟起、再 2–4 小时，记录 SLAM 频率与温度、功耗。
+3. **并机负载**：与 SLAM／导航共跑 30 分钟起、再 2–4 小时，记录 SLAM 频率与温度、功耗（侧车占用约 0.94 GiB 显存，未观察到单独测试时的抖动）。
 4. **导航 MCP／语音分流**：评估第 4 条的 `speak` 工具、`success:false` 语义、TTS 单次播报归属仍属 robot_agent／导航侧改造，不在本仓库验证范围。
 5. **许可**：RADIO 与 DFN5B 的研究用途限制未变，商用发布前必须单独解决。
-6. **容器**：本机 Docker 无 `nvidia` runtime，`deploy/Dockerfile.jetson` 未在本机构建；JP6 基础镜像拉取与构建需在有 r36 的设备或升级后进行。
+6. **容器**：本机 Docker 无 `nvidia` runtime，`deploy/Dockerfile.jetson` 与 `deploy/docker-compose.encoder.yml` 均未在本机构建；需先配置 `nvidia-container-toolkit`。
 
 ## 六、本次代码改动清单
 
@@ -190,4 +208,17 @@ HF_ENDPOINT=https://hf-mirror.com .venv-jetson/bin/python scripts/fetch_assets.p
 | `deploy/docker-compose.semantic.yml`（新增） | host 网络、数据卷、日志轮转、健康检查 |
 | `tests/test_text_tower.py`、`tests/test_data_root.py`（新增） | 文本塔等价性与数据根校验回归 |
 
-回归结果：`python -m pytest -m "not slow"` 全绿；`tests/test_text_tower.py`（需真实权重）全绿。
+GPU 侧车相关改动（详见 [orin_nx_gpu_encoder.md](orin_nx_gpu_encoder.md)）：
+
+| 文件 | 改动 |
+|---|---|
+| `src/slamibot_fieldmind/encoder_service.py`（新增） | Python 3.8 HTTP 编码侧车 |
+| `src/slamibot_fieldmind/remote_encoder.py`（新增） | Python 3.11 客户端 `HttpEncoder` |
+| `src/slamibot_fieldmind/backbone.py` | `_shim_torch_distributed()` 适配 `USE_DISTRIBUTED=0` |
+| `src/slamibot_fieldmind/text_tower.py` | 兼容 `open_clip` 2.x/3.x 的 pooling 签名 |
+| `src/slamibot_fieldmind/mcp_server.py` | 新增 `--encoder-url` |
+| `scripts/setup_gpu_encoder_env.sh`、`scripts/start_encoder_sidecar.sh`（新增） | GPU 环境与侧车启动 |
+| `configs/jetson-gpu.yaml`、`deploy/docker-compose.encoder.yml`（新增） | 侧车配置（容器未实测） |
+| `tests/test_encoder_service.py`（新增） | 侧车协议与数值往返回归 |
+
+回归结果：`python -m pytest -m "not slow"` → **249 passed, 13 skipped**；`tests/test_text_tower.py`（需真实权重）全绿。

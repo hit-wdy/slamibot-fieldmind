@@ -214,6 +214,11 @@ def main() -> int:
     parser.add_argument("--model-config", type=Path, default=ROOT / "configs" / "jetson.yaml")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8799)
+    parser.add_argument(
+        "--encoder-url",
+        help="forward to the backend's --encoder-url (GPU sidecar); omit to load the model in-process",
+    )
+    parser.add_argument("--encoder-timeout", type=float, default=120)
     parser.add_argument("--image", type=Path)
     parser.add_argument("--out", type=Path, default=ROOT / "reports" / "device_smoke.json")
     parser.add_argument("--frames", type=int, default=4)
@@ -240,6 +245,16 @@ def main() -> int:
                     args.host,
                     "--port",
                     str(args.port),
+                    *(
+                        [
+                            "--encoder-url",
+                            args.encoder_url,
+                            "--encoder-timeout",
+                            str(args.encoder_timeout),
+                        ]
+                        if args.encoder_url
+                        else []
+                    ),
                 ],
                 stdout=log,
                 stderr=subprocess.STDOUT,

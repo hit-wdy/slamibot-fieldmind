@@ -36,6 +36,8 @@ flowchart TB
 
 设备部署时，YOLO 神经网络在 OAK RVC2 上运行，驱动侧完成解码、NMS 和帧关联；RADIO 在 Orin NX 上异步运行。ROS 环境保留 DepthAI 2.30，后端环境不需要 DepthAI，也不直接打开 OAK。
 
+JetPack 5 上 RADIO 走 GPU 编码侧车：Python 3.8 进程持有 CUDA 11.4 torch 与模型，Python 3.11 后端经 loopback HTTP 取向量（`--encoder-url`），见 [docs/orin_nx_gpu_encoder.md](docs/orin_nx_gpu_encoder.md)。无 CUDA torch 时自动回退 CPU，健康检查会报告实际设备。
+
 现有离线演示采用 Ubuntu 虚拟机回放 `walk02.bag`、Windows OpenVINO CPU 执行 YOLO、Windows GPU 执行 RADIO。该回放方案与设备部署方案共用观测协议及查询服务。
 
 ## 已有能力
@@ -52,6 +54,8 @@ flowchart TB
 ## 安装与启动
 
 以下命令从仓库根目录运行，使用可编辑安装。Python 需要 3.10 或更高版本。先为目标平台安装匹配的 PyTorch／CUDA，再安装本项目；Jetson 依赖必须根据实际 JetPack／L4T 选择，不能直接套用 Windows 锁定文件。`requirements.lock.txt` 仅记录原 Windows 验证环境。
+
+JetPack 5 没有 Python ≥3.10 的 CUDA torch，此时后端用 CPU torch 运行，GPU 编码放在独立的 3.8 侧车进程里（`scripts/setup_gpu_encoder_env.sh` + `scripts/start_encoder_sidecar.sh`，后端加 `--encoder-url http://127.0.0.1:8791`）。
 
 ```bash
 python -m pip install -e ".[backend,dev]"
@@ -124,9 +128,11 @@ python -m pytest -m "not slow"
 基础测试覆盖协议、关键帧、存储恢复、检索核验和检测后处理。真实模型测试使用 `python -m pytest -m slow`，需准备权重、官方源码及适当计算资源。部分测试依赖本机历史索引或相邻设备框架，缺失时跳过。
 
 - [设备框架接入、HTTP 协议与部署](docs/slamibot_integration.md)
+- [Orin NX GPU 编码侧车](docs/orin_nx_gpu_encoder.md)
+- [Orin NX 实机部署验证](docs/orin_nx_deployment_validation.md)
 - [仓库改名与完整迁移](docs/repository_migration.md)
 - [VMware／ROS／RADIO／YOLO 交接](docs/agent_handoff_vm_ros_radio_yolo.md)
 - [walk02 回放验证](docs/rosbag_replay.md)
 - [walk02 演示录制](docs/walk02_demo_recording.md)
 
-已完成 Ubuntu 虚拟机内真实 OAK 的 DepthAI 2.30 三路 JPEG、CAM_A 板端 YOLO、桥接转发、RADIO 索引与 MCP 图片读取验证。Orin NX、真实 SLAM／RTK／外参及连续 30 分钟性能验收仍待实机完成。当前检测缓存 P95 ≤ 1 秒、索引延迟 P95 ≤ 3 秒、SLAM 输出频率下降 ≤ 10% 是待验证目标。
+已完成 Ubuntu 虚拟机内真实 OAK 的 DepthAI 2.30 三路 JPEG、CAM_A 板端 YOLO、桥接转发、RADIO 索引与 MCP 图片读取验证。Orin NX 上已完成 CPU 回退与 GPU 侧车两条路径的端到端验证：GPU 单帧 P50 1040 ms、关键帧 ready P50 1.54 s（目标 ≤3 s 已达标），见 [GPU 编码侧车](docs/orin_nx_gpu_encoder.md) 与 [实机部署验证](docs/orin_nx_deployment_validation.md)。真实 SLAM／RTK／外参、真实相机并机 30 分钟性能验收仍待完成；检测缓存 P95 ≤ 1 秒与 SLAM 输出频率下降 ≤ 10% 仍是待验证目标。

@@ -10,6 +10,7 @@ download, and we keep the CLIP text tower off the GPU unless asked for it.
 from __future__ import annotations
 
 import hashlib
+import importlib.machinery
 import importlib.util
 import json
 import os
@@ -71,6 +72,7 @@ class LoadReport:
 
 def ensure_radio_importable() -> None:
     """Put the vendored RADIO root on `sys.path` so `import radio` resolves to it."""
+    _shim_torch_distributed()
     if not (RADIO_SOURCE / "radio" / "__init__.py").is_file():
         raise FileNotFoundError(
             f"the vendored RADIO source is missing at {RADIO_SOURCE}; "
@@ -85,6 +87,70 @@ def ensure_radio_importable() -> None:
             f"a different 'radio' package was already imported from {getattr(module, '__file__', '?')}; "
             "import slamibot_fieldmind before anything else that ships a top-level 'radio' module"
         )
+
+
+def _shim_torch_distributed() -> None:
+    """Fill in the `torch.distributed` surface RADIO imports at module load.
+
+    NVIDIA's JetPack 5 aarch64 wheels are built with `USE_DISTRIBUTED=0`, so
+    `torch.distributed` exists but has no `is_initialized`/`get_rank` and no
+    `torch.distributed.nn.functional`. RADIO only uses those for multi-process
+    training (`rank_gate`, an all-reduce on the token count), never in the
+    single-process inference path we run, so no-op stand-ins are enough.
+    """
+    distributed = getattr(torch, "distributed", None)
+    if distributed is None:
+        return
+    if hasattr(torch._C, "_distributed_c10d"):
+        return
+
+    stubs = {
+        "is_available": lambda: False,
+        "is_initialized": lambda: False,
+        "get_rank": lambda group=None: 0,
+        "get_world_size": lambda group=None: 1,
+        "get_backend": lambda group=None: "undefined",
+        "destroy_process_group": lambda group=None: None,
+    }
+    for name, stub in stubs.items():
+        if not hasattr(distributed, name):
+            setattr(distributed, name, stub)
+    if not hasattr(distributed, "ReduceOp"):
+
+        class ReduceOp:  # noqa: D401 - mirrors torch.distributed.ReduceOp
+            SUM = 0
+            PRODUCT = 1
+            MIN = 2
+            MAX = 3
+            BAND = 4
+            BOR = 5
+            BXOR = 6
+            PREMUL_SUM = 7
+            AVG = 8
+
+        distributed.ReduceOp = ReduceOp
+
+    nn_package = sys.modules.get("torch.distributed.nn")
+    if nn_package is None:
+        nn_package = importlib.util.module_from_spec(
+            importlib.machinery.ModuleSpec("torch.distributed.nn", loader=None)
+        )
+        nn_package.__path__ = []
+        sys.modules["torch.distributed.nn"] = nn_package
+        distributed.nn = nn_package
+    functional = sys.modules.get("torch.distributed.nn.functional")
+    if functional is None:
+        # RADIO imports `all_reduce` at module level for the multi-process path
+        # only; in a single process it must be the identity, not a new group.
+        functional = importlib.util.module_from_spec(
+            importlib.machinery.ModuleSpec(
+                "torch.distributed.nn.functional", loader=None
+            )
+        )
+        functional.all_reduce = lambda tensor, *args, **kwargs: tensor
+        functional.all_gather = lambda tensor, *args, **kwargs: (tensor,)
+        sys.modules["torch.distributed.nn.functional"] = functional
+        nn_package.functional = functional
 
 
 def load_hubconf():
