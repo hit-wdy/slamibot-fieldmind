@@ -1,0 +1,63 @@
+# FieldMind on the Orin NX, alongside the existing SLAMIBOT stack.
+#
+# The frame driver, SLAM and navigation keep owning the hardware and the ROS
+# master. This file only adds the visual-memory backend.
+#
+# Run from the repository root (paths below are relative to deploy/):
+#   FIELDMIND_DATA=/mnt/usb/slamibot_record_data/semantic_index \
+#   docker compose -f deploy/docker-compose.semantic.yml up -d
+#
+# Weights and the third_party RADIO checkout are bind-mounted read-only, so they
+# are prepared once on the host and never baked into an image.
+services:
+  fieldmind:
+    image: ${FIELDMIND_IMAGE:-slamibot-fieldmind:jetson-local}
+    container_name: fieldmind
+    # Host networking matches the rest of the stack: the backend binds loopback
+    # and the ROS bridge posts to 127.0.0.1:8765 without extra plumbing.
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+      - HF_HUB_OFFLINE=1
+      - HF_HUB_DISABLE_TELEMETRY=1
+      - OMP_NUM_THREADS=${FIELDMIND_OMP_THREADS:-6}
+      - MKL_NUM_THREADS=${FIELDMIND_OMP_THREADS:-6}
+      - TORCH_NUM_THREADS=${FIELDMIND_OMP_THREADS:-6}
+    volumes:
+      - ${FIELDMIND_DATA:-/mnt/usb/slamibot_record_data/semantic_index}:/data/semantic_index
+      # The source tree is already in the image; this mount is for configs and
+      # for keeping the pinned model assets out of the image layer.
+      - ${FIELDMIND_ROOT:-./..}/configs:/app/configs:ro
+      - ${FIELDMIND_ROOT:-./..}/models:/app/models:ro
+      - ${FIELDMIND_ROOT:-./..}/third_party/RADIO:/app/third_party/RADIO:ro
+    working_dir: /opt/slamibot-fieldmind
+    command:
+      - python3
+      - -m
+      - slamibot_fieldmind.backend
+      - --root
+      - /data/semantic_index
+      - --model-config
+      - configs/jetson.yaml
+      - --host
+      - 127.0.0.1
+      - --port
+      - "8765"
+      - --mount-path
+      - /data
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8765/v1/health', timeout=5).status==200 else 1)"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 300s

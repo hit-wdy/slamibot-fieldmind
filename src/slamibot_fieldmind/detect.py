@@ -50,7 +50,10 @@ class YoloV6Detector:
         if not 0.0 <= confidence_threshold <= 1.0:
             raise ValueError("confidence_threshold must be in [0, 1]")
         self.archive = Path(archive)
-        if not self.archive.is_file():
+        # Geometry-only tests and the ROS-ingest backend never need the VPU
+        # blob; only an explicitly requested archive is checked here. The default
+        # archive is checked in `attach`, when it is actually about to be used.
+        if self.archive != DEFAULT_ARCHIVE and not self.archive.is_file():
             raise FileNotFoundError(
                 f"YOLO archive not found: {self.archive}\n"
                 "run: python scripts/fetch_assets.py --asset yolov6_rvc2"
@@ -67,6 +70,11 @@ class YoloV6Detector:
 
     def attach(self, pipeline: Any, camera_output: Any, dai: Any) -> Any:
         """Add the crop + network to `pipeline`, fed by `camera_output`."""
+        if not self.archive.is_file():
+            raise FileNotFoundError(
+                f"YOLO archive not found: {self.archive}\n"
+                "run: python scripts/fetch_assets.py --asset yolov6_rvc2"
+            )
         roi_size = 1.0 - 2.0 * self.roi_inset
         manip = pipeline.create(dai.node.ImageManip)
         manip.initialConfig.addCrop(

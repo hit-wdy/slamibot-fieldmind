@@ -58,6 +58,7 @@ class LoadReport:
     model_dtype: str = ""
     device: str = ""
     text_encoder_device: str = ""
+    text_encoder_dtype: str = ""
     parameter_count: int = 0
     adaptor_names: list[str] = field(default_factory=list)
     adaptor_classes: dict[str, str] = field(default_factory=dict)
@@ -204,6 +205,25 @@ def _set_conditioner_dtype(model: Any, dtype: torch.dtype) -> None:
         conditioner.dtype = dtype
 
 
+def resolve_device(name: str) -> torch.device:
+    """Resolve `auto` against the runtime instead of failing on a CPU-only host.
+
+    A device that was flashed without the vendor CUDA runtime can still run the
+    index and MCP surface, just slowly. Silently pretending CUDA works would be
+    worse; the load report records the resolved device.
+    """
+    if str(name) == "auto":
+        return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device(name)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(
+            f"model.device is {name!r} but torch.cuda.is_available() is False. "
+            "Install a CUDA build of torch for this L4T release, or set "
+            "model.device: auto to run on CPU."
+        )
+    return device
+
+
 def load_radio_model(cfg: ModelConfig, verify: bool = True) -> tuple[Any, LoadReport]:
     """Load RADIO with its adaptor and place it on the configured devices."""
     report = LoadReport(
@@ -225,9 +245,29 @@ def load_radio_model(cfg: ModelConfig, verify: bool = True) -> tuple[Any, LoadRe
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        model, checkpoint = hubconf.radio_model(
-            version=cfg.version, progress=True, adaptor_names=cfg.adaptor, return_checkpoint=True
-        )
+        if cfg.text_encoder_load == "text_only":
+            # Build only the paired text tower. The adaptor otherwise constructs
+            # the full CLIP model (including the 2.5 GB visual tower) and deletes
+            # the visual half right away, which dominates the cold-start peak on
+            # shared-memory Orin hardware.
+            from .text_tower import text_only_open_clip
+
+            # Build in the checkpoint's float32 and cast once below, so a CPU
+            # fallback does not first build bfloat16 and then convert.
+            with text_only_open_clip():
+                model, checkpoint = hubconf.radio_model(
+                    version=cfg.version,
+                    progress=True,
+                    adaptor_names=cfg.adaptor,
+                    return_checkpoint=True,
+                )
+        else:
+            model, checkpoint = hubconf.radio_model(
+                version=cfg.version,
+                progress=True,
+                adaptor_names=cfg.adaptor,
+                return_checkpoint=True,
+            )
 
     report.warnings = [f"{w.category.__name__}: {w.message}" for w in caught]
     for warning in report.warnings:
@@ -270,12 +310,26 @@ def load_radio_model(cfg: ModelConfig, verify: bool = True) -> tuple[Any, LoadRe
 
     model.eval()
     report.checkpoint_dtype = str(checkpoint_dtype)
+
+    device = resolve_device(cfg.device)
+    text_device = resolve_device(cfg.text_encoder_device)
+    # Half precision is a GPU optimisation. On CPU it hits unvectorised slow
+    # paths (measured ~70 s/frame for bfloat16 versus ~5 s for float32 on Orin
+    # NX), so an `auto`/half request falls back to float32 there and says so.
     dtype = resolve_dtype(cfg.dtype, checkpoint_dtype)
+    if device.type == "cpu" and dtype in (torch.bfloat16, torch.float16):
+        report.warnings.append(
+            f"model.dtype {dtype} is not accelerated on CPU; using float32"
+        )
+        dtype = torch.float32
     report.model_dtype = str(dtype)
 
-    device = torch.device(cfg.device)
-    text_device = torch.device(cfg.text_encoder_device)
     text_dtype = DTYPE_BY_NAME[cfg.text_encoder_dtype]
+    if text_device.type == "cpu" and text_dtype in (torch.bfloat16, torch.float16):
+        report.warnings.append(
+            f"model.text_encoder_dtype {text_dtype} is not accelerated on CPU; using float32"
+        )
+        text_dtype = torch.float32
 
     # Take the CLIP text tower out of the module tree so `.to()` skips it, then
     # place it exactly where the config says. Leaving it in would drag 1.4 GB of
@@ -289,6 +343,7 @@ def load_radio_model(cfg: ModelConfig, verify: bool = True) -> tuple[Any, LoadRe
 
     report.device = str(device)
     report.text_encoder_device = str(text_device) if detached else str(device)
+    report.text_encoder_dtype = str(text_dtype)
     report.parameter_count = sum(p.numel() for p in model.parameters())
     model.requires_grad_(False)
     return model, report

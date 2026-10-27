@@ -56,6 +56,10 @@ class ModelConfig:
     text_encoder_device: str = "cpu"
     dtype: str = "auto"
     text_encoder_dtype: str = "float32"
+    # `text_only` builds just the paired CLIP text tower instead of the full CLIP
+    # model. RADIO's adaptor deletes the visual tower immediately after building
+    # it, so `full` only adds cold-start work; keep it for A/B verification.
+    text_encoder_load: str = "text_only"
 
     # `[h, w]` selects center-crop mode, `[shortest_edge]` keeps the aspect
     # ratio. `resize_multiple: null` means "use the model's min_resolution_step".
@@ -75,6 +79,10 @@ class ModelConfig:
         if self.text_encoder_dtype not in DTYPES[1:]:
             raise ValueError(
                 f"model.text_encoder_dtype must be one of {DTYPES[1:]}, got {self.text_encoder_dtype!r}"
+            )
+        if self.text_encoder_load not in ("text_only", "full"):
+            raise ValueError(
+                f"model.text_encoder_load must be 'text_only' or 'full', got {self.text_encoder_load!r}"
             )
         resolution = [int(v) for v in (self.input_resolution or [])]
         if len(resolution) not in (1, 2) or any(v <= 0 for v in resolution):

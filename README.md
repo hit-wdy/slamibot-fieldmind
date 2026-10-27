@@ -74,7 +74,7 @@ python scripts/fetch_assets.py --asset radio_v2.5_b --asset dfn5b_clip_vit_h14_3
 slamibot-fieldmind --root data/backend --allow-unmounted --model-config configs/default.yaml
 ```
 
-等价模块命令是 `python -m slamibot_fieldmind.backend`。默认监听 `127.0.0.1:8765`；健康检查为 `/v1/health`，MCP 为 `/mcp`。设备部署默认数据目录是 `/mnt/usb/slamibot_record_data/semantic_index`，不传 `--allow-unmounted`，并使用 `configs/jetson.yaml`。默认可用空间下限为 2 GiB。
+等价模块命令是 `python -m slamibot_fieldmind.backend`。默认监听 `127.0.0.1:8765`；健康检查为 `/v1/health`，MCP 为 `/mcp`。设备部署默认数据目录是 `/mnt/usb/slamibot_record_data/semantic_index`，不传 `--allow-unmounted`，并使用 `configs/jetson.yaml`。数据目录必须位于挂载卷内；若用 NVMe 或容器 `/data`，用 `--mount-path` 指定那一层挂载点，而不是长期依赖 `--allow-unmounted`。默认可用空间下限为 2 GiB。
 
 Agent 可以直接连接 `http://127.0.0.1:8765/mcp`。需要 stdio 时，使用连接同一后端的轻量代理：
 

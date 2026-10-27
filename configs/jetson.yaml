@@ -4,10 +4,15 @@ model:
   adaptor: clip
   checkpoint: models/hub/checkpoints/radio-v2.5-b_half.pth.tar
   source_commit: 4ffaf15d0ff48197c194e306772bdb5fb92db230
-  device: cuda:0
+  # `auto` resolves to cuda:0 when torch.cuda is usable and to cpu otherwise, so
+  # the same config boots on a JetPack 5 image that has no matching CUDA torch
+  # build. The health endpoint's `environment`/load report records what won.
+  device: auto
   dtype: bfloat16
-  # Orin has shared RAM. Keep a single instance, and measure the actual peak.
-  text_encoder_device: cuda:0
+  # Orin has shared RAM. Load only the paired CLIP text tower and keep one
+  # instance; measured peak on this device is in docs/orin_nx_deployment_validation.md.
+  text_encoder_load: text_only
+  text_encoder_device: auto
   text_encoder_dtype: bfloat16
   input_resolution: [512]
   batch_size: 1

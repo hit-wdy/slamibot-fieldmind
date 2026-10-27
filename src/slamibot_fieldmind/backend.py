@@ -276,6 +276,11 @@ def main(argv=None):
         action="store_true",
         help="explicit local development override",
     )
+    p.add_argument(
+        "--mount-path",
+        type=Path,
+        help="mounted volume that must contain --root (default: /mnt/usb)",
+    )
     p.add_argument("--min-free-gib", type=float, default=2)
     p.add_argument("--distance-m", type=float, default=0.5)
     p.add_argument("--rotation-deg", type=float, default=15)
@@ -304,6 +309,7 @@ def main(argv=None):
             collection_id=args.collection_id,
             min_free_bytes=int(args.min_free_gib * 1024**3),
             require_mount=not args.allow_unmounted,
+            mount_path=args.mount_path,
             policy=KeyframePolicy(
                 args.distance_m,
                 args.rotation_deg,
